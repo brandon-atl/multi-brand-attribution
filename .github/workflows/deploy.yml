@@ -25,7 +25,7 @@ jobs:
         id: snowsql
         continue-on-error: true
         env:
-          SNOWSQL_VERSION: "1.2.31"   # use a supported 1.2.x; update if you prefer a newer 1.2.x
+          SNOWSQL_VERSION: "1.2.31"   # update to a newer 1.2.x if desired
         run: |
           set -euxo pipefail
           # Snowflake hosts installers by major.minor; do not use 1.2.31 in the folder name:
@@ -137,7 +137,7 @@ jobs:
           CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
           WITH f AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
           SELECT o.CUSTOMER_ID, o.BRAND AS FIRST_PURCHASE_BRAND, f.FIRST_ORDER_UTC
-          FROM FACT_ORDERS o JOIN f USING(CUSTOMER_ID)
+          FROM FACT_ORDERS o JOIN f USING (CUSTOMER_ID)
           WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
           QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
 
@@ -165,19 +165,20 @@ jobs:
           python-version: '3.11'
 
       # ───────────────────────────────────────────────────────────────────────────
-      # FIX 2: Host-aware Python fallback to avoid 250001 account parsing issues
+      # FIX 2: Host-aware Python fallback to avoid 251001/251000 account issues
       # ───────────────────────────────────────────────────────────────────────────
       - name: Python fallback — run deploy script
         if: steps.snowsql.outputs.ok != 'true'
         env:
-          SNOW_HOST:      ${{ secrets.SNOW_HOST }}          # e.g., JZIPRSC-ISC01138.snowflakecomputing.com
-          SNOW_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}       # e.g., jziprsc-isc01138
-          SNOW_USER:      ${{ secrets.SNOW_USER }}
-          SNOW_PASSWORD:  ${{ secrets.SNOW_PASSWORD }}
-          SNOW_ROLE:      ${{ secrets.SNOW_ROLE }}
-          SNOW_WAREHOUSE: ${{ secrets.SNOW_WAREHOUSE }}
-          SNOW_DATABASE:  ${{ secrets.SNOW_DATABASE }}
-          SNOW_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
+          SNOW_HOST:            ${{ secrets.SNOW_HOST }}              # e.g., JZIPRSC-ISC01138.snowflakecomputing.com
+          SNOW_ACCOUNT:         ${{ secrets.SNOW_ACCOUNT }}           # e.g., jziprsc-isc01138
+          SNOWFLAKE_ACCOUNT:    ${{ secrets.SNOWFLAKE_ACCOUNT }}      # optional alias; same value if used
+          SNOW_USER:            ${{ secrets.SNOW_USER }}
+          SNOW_PASSWORD:        ${{ secrets.SNOW_PASSWORD }}
+          SNOW_ROLE:            ${{ secrets.SNOW_ROLE }}
+          SNOW_WAREHOUSE:       ${{ secrets.SNOW_WAREHOUSE }}
+          SNOW_DATABASE:        ${{ secrets.SNOW_DATABASE }}
+          SNOW_SCHEMA:          ${{ secrets.SNOW_SCHEMA }}
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
@@ -187,8 +188,9 @@ jobs:
           import os
           import snowflake.connector as sf
 
-          host = os.environ.get('SNOW_HOST', '').strip()
-          acct = os.environ.get('SNOW_ACCOUNT', '').strip()
+          host = (os.getenv('SNOW_HOST') or '').strip()
+          acct = (os.getenv('SNOW_ACCOUNT') or os.getenv('SNOWFLAKE_ACCOUNT') or '').strip()
+
           user = os.environ['SNOW_USER']
           pwd  = os.environ['SNOW_PASSWORD']
           role = os.environ['SNOW_ROLE']
@@ -196,17 +198,24 @@ jobs:
           db   = os.environ['SNOW_DATABASE']
           sc   = os.environ['SNOW_SCHEMA']
 
+          # Build connection kwargs. Provide both host and account when available.
           kwargs = dict(user=user, password=pwd, role=role, warehouse=wh, database=db, schema=sc)
           if host:
               kwargs['host'] = host
-          else:
-              kwargs['account'] = acct  # fallback if you didn't set SNOW_HOST
+          if acct:
+              kwargs['account'] = acct
+
+          if ('host' not in kwargs) and ('account' not in kwargs):
+              raise RuntimeError(
+                  "Snowflake account not provided. Set repo secret SNOW_ACCOUNT or SNOWFLAKE_ACCOUNT, "
+                  "or provide SNOW_HOST."
+              )
 
           ctx = sf.connect(**kwargs)
           cs = ctx.cursor()
           try:
               def exec(sql):
-                  print("SQL>", sql.split('\n')[0][:80], '...')
+                  print("SQL>", sql.splitlines()[0][:80], '...')
                   cs.execute(sql)
 
               # Bootstrap
@@ -220,7 +229,7 @@ jobs:
               exec("CREATE OR REPLACE TABLE DIM_CHANNEL (CHANNEL_ID INT, CHANNEL_NAME STRING)")
               exec("CREATE OR REPLACE TABLE DIM_CUSTOMER (CUSTOMER_ID INT, SIGNUP_UTC TIMESTAMP_NTZ, COUNTRY STRING)")
               exec("CREATE OR REPLACE TABLE FACT_SESSIONS (SESSION_ID INT, CUSTOMER_ID INT, SESSION_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING)")
-              exec("CREATE OR REPLACE TABLE FACT_ORDERS  (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING, UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2))")
+              exec("CREATE OR REPLACE TABLE FACT_ORDERS (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING, UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2))")
 
               sp = r'''
               CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
@@ -273,7 +282,7 @@ jobs:
               CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
               WITH f AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
               SELECT o.CUSTOMER_ID, o.BRAND AS FIRST_PURCHASE_BRAND, f.FIRST_ORDER_UTC
-              FROM FACT_ORDERS o JOIN f USING(CUSTOMER_ID)
+              FROM FACT_ORDERS o JOIN f USING (CUSTOMER_ID)
               WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
               QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
               """)
