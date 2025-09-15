@@ -1,4 +1,4 @@
-name: Deploy to Snowflake 
+name: Deploy to Snowflake
 
 on:
   push: { branches: [ "main" ] }
@@ -18,14 +18,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ca-certificates curl libffi-dev libssl-dev
 
+      # ───────────────────────────────────────────────────────────────────────────
+      # FIX 1: Use supported SnowSQL version AND proper major.minor bootstrap path
+      # ───────────────────────────────────────────────────────────────────────────
       - name: Install SnowSQL (with logs)
         id: snowsql
         continue-on-error: true
         env:
-          SNOWSQL_VERSION: "1.2.24"
+          SNOWSQL_VERSION: "1.2.31"   # use a supported 1.2.x; update if you prefer a newer 1.2.x
         run: |
           set -euxo pipefail
-          curl -fsSL https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/${SNOWSQL_VERSION}/linux_x86_64/snowsql-${SNOWSQL_VERSION}-linux_x86_64.bash -o snowsql.bash
+          # Snowflake hosts installers by major.minor; do not use 1.2.31 in the folder name:
+          curl -fsSL https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.2/linux_x86_64/snowsql-${SNOWSQL_VERSION}-linux_x86_64.bash -o snowsql.bash
           bash snowsql.bash -y > snowsql_install.log 2>&1 || true
           SNOWSQL_BIN="$HOME/.snowsql/snowsql"
           if [ -x "$SNOWSQL_BIN" ]; then
@@ -33,7 +37,7 @@ jobs:
             "$SNOWSQL_BIN" --version || true
           else
             echo "ok=false" >> $GITHUB_OUTPUT
-            echo "==== SnowSQL install log ===="
+            echo "==== SnowSQL install log (tail) ===="
             tail -200 snowsql_install.log || true
           fi
 
@@ -150,7 +154,9 @@ jobs:
           CALL GENERATE_DEMO_DATA();
           SQL
 
-          "$HOME/.snowsql/snowsql" -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f seed_and_views.sql
+          "$HOME/.snowsql/snowsql" -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" \
+            -r "$SNOWSQL_ROLE" -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" \
+            -f seed_and_views.sql
 
       - name: Python fallback — install connector
         if: steps.snowsql.outputs.ok != 'true'
@@ -158,10 +164,14 @@ jobs:
         with:
           python-version: '3.11'
 
+      # ───────────────────────────────────────────────────────────────────────────
+      # FIX 2: Host-aware Python fallback to avoid 250001 account parsing issues
+      # ───────────────────────────────────────────────────────────────────────────
       - name: Python fallback — run deploy script
         if: steps.snowsql.outputs.ok != 'true'
         env:
-          SNOW_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
+          SNOW_HOST:      ${{ secrets.SNOW_HOST }}          # e.g., JZIPRSC-ISC01138.snowflakecomputing.com
+          SNOW_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}       # e.g., jziprsc-isc01138
           SNOW_USER:      ${{ secrets.SNOW_USER }}
           SNOW_PASSWORD:  ${{ secrets.SNOW_PASSWORD }}
           SNOW_ROLE:      ${{ secrets.SNOW_ROLE }}
@@ -177,7 +187,8 @@ jobs:
           import os
           import snowflake.connector as sf
 
-          acct = os.environ['SNOW_ACCOUNT']
+          host = os.environ.get('SNOW_HOST', '').strip()
+          acct = os.environ.get('SNOW_ACCOUNT', '').strip()
           user = os.environ['SNOW_USER']
           pwd  = os.environ['SNOW_PASSWORD']
           role = os.environ['SNOW_ROLE']
@@ -185,7 +196,13 @@ jobs:
           db   = os.environ['SNOW_DATABASE']
           sc   = os.environ['SNOW_SCHEMA']
 
-          ctx = sf.connect(account=acct, user=user, password=pwd, role=role, warehouse=wh, database=db, schema=sc)
+          kwargs = dict(user=user, password=pwd, role=role, warehouse=wh, database=db, schema=sc)
+          if host:
+              kwargs['host'] = host
+          else:
+              kwargs['account'] = acct  # fallback if you didn't set SNOW_HOST
+
+          ctx = sf.connect(**kwargs)
           cs = ctx.cursor()
           try:
               def exec(sql):
@@ -205,7 +222,6 @@ jobs:
               exec("CREATE OR REPLACE TABLE FACT_SESSIONS (SESSION_ID INT, CUSTOMER_ID INT, SESSION_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING)")
               exec("CREATE OR REPLACE TABLE FACT_ORDERS  (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING, UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2))")
 
-              # Snowpark seeding SP
               sp = r'''
               CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
               RETURNS STRING
@@ -227,18 +243,18 @@ jobs:
                   N=50000; start=pd.Timestamp("2024-09-01"); end=pd.Timestamp("2025-08-31")
                   def r(n):
                       d=(end-start).total_seconds()
-                      return [start + pd.Timedelta(seconds=float(rng.uniform(0,d))) for _ in range(n)]
+                      return [start + pd.Timedelta(seconds=float(np.random.uniform(0,d))) for _ in range(n)]
 
-                  cust=pd.DataFrame({"CUSTOMER_ID":range(1,N+1),"SIGNUP_UTC":r(N),"COUNTRY":rng.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])})
+                  cust=pd.DataFrame({"CUSTOMER_ID":range(1,N+1),"SIGNUP_UTC":r(N),"COUNTRY":np.random.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])})
                   session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
 
                   rows=[]; oid=1
                   for cid in range(1,N+1):
-                      k=int(np.clip(rng.poisson(1.4),0,6))
+                      k=int(np.clip(np.random.poisson(1.4),0,6))
                       if k==0: continue
                       times=sorted(r(k))
-                      bsel=rng.choice(brands, size=k, p=[.55,.30,.15])
-                      ch  =rng.choice(channels, size=k, p=[.45,.12,.18,.15,.06,.04])
+                      bsel=np.random.choice(["JCREW","FACTORY","MADEWELL"], size=k, p=[.55,.30,.15])
+                      ch  =np.random.choice(["Direct","Email","Paid Search","Social","Affiliate","Display"], size=k, p=[.45,.12,.18,.15,.06,.04])
                       for t,b,c in zip(times,bsel,ch):
                           base=120 if b=="JCREW" else 85 if b=="MADEWELL" else 70
                           units=max(1, int(np.round(np.random.gamma(2.0,0.8))))
