@@ -1,4 +1,4 @@
-# Multi-Brand Attribution Analysis (Snowflake + Power BI)
+# Multi-Brand Attribution Analysis 
 
 This repo deploys a small Snowflake model and seeds demo data:
 - **% of customers who shopped Brand X first**
