@@ -1,0 +1,129 @@
+name: Deploy to Snowflake 
+
+on:
+  push: { branches: [ "main" ] }
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SnowSQL on runner
+        run: |
+          curl -L https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.2/linux_x86_64/snowsql-1.2.24-linux_x86_64.bash -o snowsql.bash
+          bash snowsql.bash -y
+          ~/.snowsql/snowsql --version
+
+      - name: Bootstrap schema/tables (idempotent)
+        env:
+          SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
+          SNOWSQL_USER:      ${{ secrets.SNOW_USER }}
+          SNOWSQL_PWD:       ${{ secrets.SNOW_PASSWORD }}
+          SNOWSQL_ROLE:      ${{ secrets.SNOW_ROLE }}
+          SNOWSQL_WAREHOUSE: ${{ secrets.SNOW_WAREHOUSE }}
+          SNOWSQL_DATABASE:  ${{ secrets.SNOW_DATABASE }}
+          SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
+        run: |
+          cat > bootstrap.sql <<'SQL'
+          USE ROLE IDENTIFIER($SNOW_ROLE);
+          USE WAREHOUSE IDENTIFIER($SNOW_WAREHOUSE);
+          USE DATABASE IDENTIFIER($SNOW_DATABASE);
+          CREATE SCHEMA IF NOT EXISTS IDENTIFIER($SNOW_SCHEMA);
+          USE SCHEMA IDENTIFIER($SNOW_SCHEMA);
+
+          CREATE OR REPLACE TABLE DIM_BRAND (BRAND_ID INT, BRAND_CODE STRING);
+          CREATE OR REPLACE TABLE DIM_CHANNEL (CHANNEL_ID INT, CHANNEL_NAME STRING);
+          CREATE OR REPLACE TABLE DIM_CUSTOMER (CUSTOMER_ID INT, SIGNUP_UTC TIMESTAMP_NTZ, COUNTRY STRING);
+          CREATE OR REPLACE TABLE FACT_SESSIONS (SESSION_ID INT, CUSTOMER_ID INT, SESSION_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING);
+          CREATE OR REPLACE TABLE FACT_ORDERS  (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING,
+                                                UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2));
+          SQL
+
+          ~/.snowsql/snowsql -a $SNOWSQL_ACCOUNT -u $SNOWSQL_USER -r $SNOWSQL_ROLE \
+            -w $SNOWSQL_WAREHOUSE -d $SNOWSQL_DATABASE -f bootstrap.sql
+
+      - name: Create Snowpark SP and seed data + views
+        env:
+          SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
+          SNOWSQL_USER:      ${{ secrets.SNOW_USER }}
+          SNOWSQL_PWD:       ${{ secrets.SNOW_PASSWORD }}
+          SNOWSQL_ROLE:      ${{ secrets.SNOW_ROLE }}
+          SNOWSQL_WAREHOUSE: ${{ secrets.SNOW_WAREHOUSE }}
+          SNOWSQL_DATABASE:  ${{ secrets.SNOW_DATABASE }}
+          SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
+        run: |
+          cat > seed_and_views.sql <<'SQL'
+          USE ROLE IDENTIFIER($SNOW_ROLE);
+          USE WAREHOUSE IDENTIFIER($SNOW_WAREHOUSE);
+          USE DATABASE IDENTIFIER($SNOW_DATABASE);
+          USE SCHEMA IDENTIFIER($SNOW_SCHEMA);
+
+          CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
+          RETURNS STRING
+          LANGUAGE PYTHON
+          RUNTIME_VERSION='3.10'
+          PACKAGES=('snowflake-snowpark-python','pandas','numpy')
+          HANDLER='run'
+          AS
+          $$
+          from snowflake.snowpark import Session
+          import pandas as pd, numpy as np
+          def run(session: Session) -> str:
+              rng=np.random.default_rng(42)
+              brands=["JCREW","FACTORY","MADEWELL"]
+              channels=["Direct","Email","Paid Search","Social","Affiliate","Display"]
+              session.create_dataframe(pd.DataFrame({"BRAND_ID":[1,2,3],"BRAND_CODE":brands})).write.mode("overwrite").save_as_table("DIM_BRAND")
+              session.create_dataframe(pd.DataFrame({"CHANNEL_ID":range(1,7),"CHANNEL_NAME":channels})).write.mode("overwrite").save_as_table("DIM_CHANNEL")
+
+              N=50000; start=pd.Timestamp("2024-09-01"); end=pd.Timestamp("2025-08-31")
+              def r(n):
+                  d=(end-start).total_seconds()
+                  return [start + pd.Timedelta(seconds=float(rng.uniform(0,d))) for _ in range(n)]
+
+              cust=pd.DataFrame({"CUSTOMER_ID":range(1,N+1),"SIGNUP_UTC":r(N),"COUNTRY":rng.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])})
+              session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
+
+              rows=[]; oid=1
+              for cid in range(1,N+1):
+                  k=int(np.clip(rng.poisson(1.4),0,6))
+                  if k==0: continue
+                  times=sorted(r(k))
+                  bsel=rng.choice(brands, size=k, p=[.55,.30,.15])
+                  ch  =rng.choice(channels, size=k, p=[.45,.12,.18,.15,.06,.04])
+                  for t,b,c in zip(times,bsel,ch):
+                      base=120 if b=="JCREW" else 85 if b=="MADEWELL" else 70
+                      units=max(1, int(np.round(rng.gamma(2.0,0.8))))
+                      price=max(25, rng.normal(base,18))
+                      rev=round(units*price,2); margin=round(rev*rng.uniform(.48,.63),2)
+                      rows.append((oid,cid,str(t),b,c,units,rev,margin)); oid+=1
+
+              df=pd.DataFrame(rows, columns=["ORDER_ID","CUSTOMER_ID","ORDER_UTC","BRAND","CHANNEL","UNITS","REVENUE","MARGIN"])
+              session.write_pandas(df, "FACT_ORDERS", auto_create_table=True, overwrite=True)
+              return f"Loaded {len(df):,} orders for {N:,} customers."
+          $$;
+
+          -- Views for the dashboard
+          CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
+          WITH f AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
+          SELECT o.CUSTOMER_ID, o.BRAND AS FIRST_PURCHASE_BRAND, f.FIRST_ORDER_UTC
+          FROM FACT_ORDERS o JOIN f USING(CUSTOMER_ID)
+          WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
+
+          CREATE OR REPLACE VIEW VW_BRAND_FLOWS_ANY AS
+          SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
+          FROM FACT_ORDERS o JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID) GROUP BY 1,2;
+
+          CREATE OR REPLACE VIEW VW_BRAND_FLOWS_SUBSEQ AS
+          WITH ft AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
+          SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
+          FROM FACT_ORDERS o JOIN ft USING (CUSTOMER_ID) JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
+          WHERE o.ORDER_UTC > ft.FIRST_ORDER_UTC GROUP BY 1,2;
+
+          CALL GENERATE_DEMO_DATA();
+          SQL
+
+          ~/.snowsql/snowsql -a $SNOWSQL_ACCOUNT -u $SNOWSQL_USER -r $SNOWSQL_ROLE \
+            -w $SNOWSQL_WAREHOUSE -d $SNOWSQL_DATABASE -f seed_and_views.sql
