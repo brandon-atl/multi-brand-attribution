@@ -1,15 +1,12 @@
 name: Deploy to Snowflake
 
 on:
-  push:
-    branches:
-      - "main"
+  push: { branches: [ "main" ] }
   workflow_dispatch: {}
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,29 +18,33 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ca-certificates curl libffi-dev libssl-dev
 
+      # ───────────────────────────────────────────────────────────────────────────
+      # FIX 1: Use supported SnowSQL version AND proper major.minor bootstrap path
+      # ───────────────────────────────────────────────────────────────────────────
       - name: Install SnowSQL (with logs)
         id: snowsql
         continue-on-error: true
         env:
-          VER: "1.2.31"
+          SNOWSQL_VERSION: "1.2.31"   # update to a newer 1.2.x if desired
         run: |
           set -euxo pipefail
-          # Use major.minor bootstrap path (1.2) with a concrete version file
-          curl -fsSL "https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.2/linux_x86_64/snowsql-${VER}-linux_x86_64.bash" -o snowsql.bash
+          # Snowflake hosts installers by major.minor; do not use 1.2.31 in the folder name:
+          curl -fsSL https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.2/linux_x86_64/snowsql-${SNOWSQL_VERSION}-linux_x86_64.bash -o snowsql.bash
           bash snowsql.bash -y > snowsql_install.log 2>&1 || true
-          if [ -x "$HOME/.snowsql/snowsql" ]; then
-            echo "ok=true" >> "$GITHUB_OUTPUT"
-            "$HOME/.snowsql/snowsql" --version || true
+          SNOWSQL_BIN="$HOME/.snowsql/snowsql"
+          if [ -x "$SNOWSQL_BIN" ]; then
+            echo "ok=true" >> $GITHUB_OUTPUT
+            "$SNOWSQL_BIN" --version || true
           else
-            echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "==== SnowSQL install log tail ===="
+            echo "ok=false" >> $GITHUB_OUTPUT
+            echo "==== SnowSQL install log (tail) ===="
             tail -200 snowsql_install.log || true
           fi
 
       - name: Show decision
         run: echo "SnowSQL available? -> ${{ steps.snowsql.outputs.ok }}"
 
-      - name: Bootstrap schema/tables via SnowSQL
+      - name: Run bootstrap via SnowSQL
         if: steps.snowsql.outputs.ok == 'true'
         env:
           SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
@@ -55,47 +56,23 @@ jobs:
           SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
         run: |
           set -euxo pipefail
-
           cat > bootstrap.sql <<'SQL'
-USE ROLE IDENTIFIER($SNOW_ROLE);
-USE WAREHOUSE IDENTIFIER($SNOW_WAREHOUSE);
-USE DATABASE IDENTIFIER($SNOW_DATABASE);
-CREATE SCHEMA IF NOT EXISTS IDENTIFIER($SNOW_SCHEMA);
-USE SCHEMA IDENTIFIER($SNOW_SCHEMA);
+          USE ROLE IDENTIFIER($SNOW_ROLE);
+          USE WAREHOUSE IDENTIFIER($SNOW_WAREHOUSE);
+          USE DATABASE IDENTIFIER($SNOW_DATABASE);
+          CREATE SCHEMA IF NOT EXISTS IDENTIFIER($SNOW_SCHEMA);
+          USE SCHEMA IDENTIFIER($SNOW_SCHEMA);
 
-CREATE OR REPLACE TABLE DIM_BRAND (BRAND_ID INT, BRAND_CODE STRING);
-CREATE OR REPLACE TABLE DIM_CHANNEL (CHANNEL_ID INT, CHANNEL_NAME STRING);
-CREATE OR REPLACE TABLE DIM_CUSTOMER (CUSTOMER_ID INT, SIGNUP_UTC TIMESTAMP_NTZ, COUNTRY STRING);
-CREATE OR REPLACE TABLE FACT_SESSIONS (
-  SESSION_ID INT,
-  CUSTOMER_ID INT,
-  SESSION_UTC TIMESTAMP_NTZ,
-  BRAND STRING,
-  CHANNEL STRING
-);
-CREATE OR REPLACE TABLE FACT_ORDERS  (
-  ORDER_ID INT,
-  CUSTOMER_ID INT,
-  ORDER_UTC TIMESTAMP_NTZ,
-  BRAND STRING,
-  CHANNEL STRING,
-  UNITS NUMBER(9,0),
-  REVENUE NUMBER(12,2),
-  MARGIN NUMBER(12,2)
-);
-SQL
+          CREATE OR REPLACE TABLE DIM_BRAND (BRAND_ID INT, BRAND_CODE STRING);
+          CREATE OR REPLACE TABLE DIM_CHANNEL (CHANNEL_ID INT, CHANNEL_NAME STRING);
+          CREATE OR REPLACE TABLE DIM_CUSTOMER (CUSTOMER_ID INT, SIGNUP_UTC TIMESTAMP_NTZ, COUNTRY STRING);
+          CREATE OR REPLACE TABLE FACT_SESSIONS (SESSION_ID INT, CUSTOMER_ID INT, SESSION_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING);
+          CREATE OR REPLACE TABLE FACT_ORDERS  (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING,
+                                                UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2));
+          SQL
+          "$HOME/.snowsql/snowsql" -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f bootstrap.sql
 
-          "$HOME/.snowsql/snowsql" \
-            -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" \
-            -r "$SNOWSQL_ROLE" -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" \
-            -o exit_on_error=true -o variable_substitution=true \
-            -D SNOW_ROLE="$SNOWSQL_ROLE" \
-            -D SNOW_WAREHOUSE="$SNOWSQL_WAREHOUSE" \
-            -D SNOW_DATABASE="$SNOWSQL_DATABASE" \
-            -D SNOW_SCHEMA="$SNOWSQL_SCHEMA" \
-            -f bootstrap.sql
-
-      - name: Seed data + create views via SnowSQL
+      - name: Seed + Views via SnowSQL
         if: steps.snowsql.outputs.ok == 'true'
         env:
           SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
@@ -107,194 +84,12 @@ SQL
           SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
         run: |
           set -euxo pipefail
-
-          # Write SP + Views flush-left to avoid Python IndentationError
           cat > seed_and_views.sql <<'SQL'
-USE ROLE IDENTIFIER($SNOW_ROLE);
-USE WAREHOUSE IDENTIFIER($SNOW_WAREHOUSE);
-USE DATABASE IDENTIFIER($SNOW_DATABASE);
-USE SCHEMA IDENTIFIER($SNOW_SCHEMA);
+          USE ROLE IDENTIFIER($SNOW_ROLE);
+          USE WAREHOUSE IDENTIFIER($SNOW_WAREHOUSE);
+          USE DATABASE IDENTIFIER($SNOW_DATABASE);
+          USE SCHEMA IDENTIFIER($SNOW_SCHEMA);
 
-CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
-RETURNS STRING
-LANGUAGE PYTHON
-RUNTIME_VERSION='3.10'
-PACKAGES=('snowflake-snowpark-python','pandas','numpy')
-HANDLER='run'
-AS
-$$
-from snowflake.snowpark import Session
-import pandas as pd
-import numpy as np
-
-def run(session: Session) -> str:
-    rng = np.random.default_rng(42)
-    brands   = ["JCREW","FACTORY","MADEWELL"]
-    channels = ["Direct","Email","Paid Search","Social","Affiliate","Display"]
-
-    session.create_dataframe(pd.DataFrame({"BRAND_ID":[1,2,3],"BRAND_CODE":brands})) \
-           .write.mode("overwrite").save_as_table("DIM_BRAND")
-    session.create_dataframe(pd.DataFrame({"CHANNEL_ID":list(range(1,7)),"CHANNEL_NAME":channels})) \
-           .write.mode("overwrite").save_as_table("DIM_CHANNEL")
-
-    N = 50000
-    start = pd.Timestamp("2024-09-01 00:00:00")
-    end   = pd.Timestamp("2025-08-31 23:59:59")
-    span  = (end - start).total_seconds()
-
-    signups = start + pd.to_timedelta(np.array(rng.uniform(0, span, size=N)), unit="s")
-    cust = pd.DataFrame({
-        "CUSTOMER_ID": np.arange(1, N+1, dtype="int64"),
-        "SIGNUP_UTC":  pd.to_datetime(signups),
-        "COUNTRY":     rng.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])
-    })
-    session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
-
-    rows = []
-    oid = 1
-    k_per = np.clip(rng.poisson(1.4, size=N), 0, 6).astype(int)
-
-    for cid, k in zip(range(1, N+1), k_per):
-        if k == 0:
-            continue
-        times = np.sort(start + pd.to_timedelta(rng.uniform(0, span, size=k), unit="s"))
-        bsel  = rng.choice(brands,   size=k, p=[.55,.30,.15])
-        chsel = rng.choice(channels, size=k, p=[.45,.12,.18,.15,.06,.04])
-        for t, b, c in zip(times, bsel, chsel):
-            base  = 120 if b=="JCREW" else 85 if b=="MADEWELL" else 70
-            units = max(1, int(np.round(rng.gamma(2.0, 0.8))))
-            price = max(25.0, float(rng.normal(base, 18)))
-            rev   = round(units * price, 2)
-            margin= round(rev * float(rng.uniform(0.48, 0.63)), 2)
-            rows.append((oid, cid, pd.to_datetime(t), b, c, int(units), rev, margin))
-            oid += 1
-
-    df = pd.DataFrame(rows, columns=[
-        "ORDER_ID","CUSTOMER_ID","ORDER_UTC","BRAND","CHANNEL","UNITS","REVENUE","MARGIN"
-    ])
-    df["ORDER_ID"]    = df["ORDER_ID"].astype("int64")
-    df["CUSTOMER_ID"] = df["CUSTOMER_ID"].astype("int64")
-    df["UNITS"]       = df["UNITS"].astype("int64")
-    df["ORDER_UTC"]   = pd.to_datetime(df["ORDER_UTC"])
-
-    session.write_pandas(df, "FACT_ORDERS", auto_create_table=True, overwrite=True)
-    return f"Loaded {len(df):,} orders for {N:,} customers."
-$$;
-
-CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
-WITH first_ts AS (
-  SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC
-  FROM FACT_ORDERS
-  GROUP BY 1
-)
-SELECT
-  o.CUSTOMER_ID,
-  o.BRAND AS FIRST_PURCHASE_BRAND,
-  f.FIRST_ORDER_UTC
-FROM FACT_ORDERS o
-JOIN first_ts f USING (CUSTOMER_ID)
-WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
-QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
-
-CREATE OR REPLACE VIEW VW_BRAND_FLOWS_ANY AS
-SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
-FROM FACT_ORDERS o JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
-GROUP BY 1,2;
-
-CREATE OR REPLACE VIEW VW_BRAND_FLOWS_SUBSEQ AS
-WITH first_ts AS (
-  SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC
-  FROM FACT_ORDERS
-  GROUP BY 1
-)
-SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
-FROM FACT_ORDERS o
-JOIN first_ts ft USING (CUSTOMER_ID)
-JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
-WHERE o.ORDER_UTC > ft.FIRST_ORDER_UTC
-GROUP BY 1,2;
-
-CALL GENERATE_DEMO_DATA();
-SQL
-
-          "$HOME/.snowsql/snowsql" \
-            -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" \
-            -r "$SNOWSQL_ROLE" -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" \
-            -o exit_on_error=true -o variable_substitution=true \
-            -D SNOW_ROLE="$SNOWSQL_ROLE" \
-            -D SNOW_WAREHOUSE="$SNOWSQL_WAREHOUSE" \
-            -D SNOW_DATABASE="$SNOWSQL_DATABASE" \
-            -D SNOW_SCHEMA="$SNOWSQL_SCHEMA" \
-            -f seed_and_views.sql
-
-      # ---------- Python fallback if SnowSQL is unavailable ----------
-      - name: Setup Python for fallback
-        if: steps.snowsql.outputs.ok != 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Python fallback — deploy
-        if: steps.snowsql.outputs.ok != 'true'
-        env:
-          SNOW_HOST:      ${{ secrets.SNOW_HOST }}
-          SNOW_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
-          SNOW_USER:      ${{ secrets.SNOW_USER }}
-          SNOW_PASSWORD:  ${{ secrets.SNOW_PASSWORD }}
-          SNOW_ROLE:      ${{ secrets.SNOW_ROLE }}
-          SNOW_WAREHOUSE: ${{ secrets.SNOW_WAREHOUSE }}
-          SNOW_DATABASE:  ${{ secrets.SNOW_DATABASE }}
-          SNOW_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
-        run: |
-          set -euxo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install snowflake-connector-python pandas numpy
-
-          python - <<'PY'
-          import os
-          import snowflake.connector as sf
-
-          host = os.environ.get('SNOW_HOST', '').strip()
-          acct = os.environ.get('SNOW_ACCOUNT', '').strip()
-
-          kwargs = dict(
-              user=os.environ['SNOW_USER'],
-              password=os.environ['SNOW_PASSWORD'],
-              role=os.environ['SNOW_ROLE'],
-              warehouse=os.environ['SNOW_WAREHOUSE'],
-              database=os.environ['SNOW_DATABASE'],
-              schema=os.environ['SNOW_SCHEMA'],
-          )
-          if host:
-              kwargs['host'] = host
-          elif acct:
-              kwargs['account'] = acct
-          else:
-              raise RuntimeError("Provide SNOW_HOST or SNOW_ACCOUNT in repo secrets.")
-
-          ctx = sf.connect(**kwargs)
-          cs = ctx.cursor()
-
-          def exec(sql):
-              print("SQL>", sql.splitlines()[0])
-              cs.execute(sql)
-
-          # Bootstrap
-          exec("CREATE SCHEMA IF NOT EXISTS " + os.environ['SNOW_SCHEMA'])
-          exec("USE ROLE " + os.environ['SNOW_ROLE'])
-          exec("USE WAREHOUSE " + os.environ['SNOW_WAREHOUSE'])
-          exec("USE DATABASE " + os.environ['SNOW_DATABASE'])
-          exec("USE SCHEMA " + os.environ['SNOW_SCHEMA'])
-
-          # Tables
-          exec("CREATE OR REPLACE TABLE DIM_BRAND (BRAND_ID INT, BRAND_CODE STRING)")
-          exec("CREATE OR REPLACE TABLE DIM_CHANNEL (CHANNEL_ID INT, CHANNEL_NAME STRING)")
-          exec("CREATE OR REPLACE TABLE DIM_CUSTOMER (CUSTOMER_ID INT, SIGNUP_UTC TIMESTAMP_NTZ, COUNTRY STRING)")
-          exec("CREATE OR REPLACE TABLE FACT_SESSIONS (SESSION_ID INT, CUSTOMER_ID INT, SESSION_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING)")
-          exec("CREATE OR REPLACE TABLE FACT_ORDERS (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING, UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2))")
-
-          # Stored procedure (as a single string; indentation preserved correctly)
-          exec(r"""
           CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
           RETURNS STRING
           LANGUAGE PYTHON
@@ -304,81 +99,209 @@ SQL
           AS
           $$
           from snowflake.snowpark import Session
-          import pandas as pd
-          import numpy as np
-
+          import pandas as pd, numpy as np
           def run(session: Session) -> str:
               rng=np.random.default_rng(42)
               brands=["JCREW","FACTORY","MADEWELL"]
               channels=["Direct","Email","Paid Search","Social","Affiliate","Display"]
+              session.create_dataframe(pd.DataFrame({"BRAND_ID":[1,2,3],"BRAND_CODE":brands})).write.mode("overwrite").save_as_table("DIM_BRAND")
+              session.create_dataframe(pd.DataFrame({"CHANNEL_ID":range(1,7),"CHANNEL_NAME":channels})).write.mode("overwrite").save_as_table("DIM_CHANNEL")
 
-              session.create_dataframe(pd.DataFrame({"BRAND_ID":[1,2,3],"BRAND_CODE":brands})) \
-                     .write.mode("overwrite").save_as_table("DIM_BRAND")
-              session.create_dataframe(pd.DataFrame({"CHANNEL_ID":list(range(1,7)),"CHANNEL_NAME":channels})) \
-                     .write.mode("overwrite").save_as_table("DIM_CHANNEL")
+              N=50000; start=pd.Timestamp("2024-09-01"); end=pd.Timestamp("2025-08-31")
+              def r(n):
+                  d=(end-start).total_seconds()
+                  return [start + pd.Timedelta(seconds=float(rng.uniform(0,d))) for _ in range(n)]
 
-              N=50000
-              start=pd.Timestamp("2024-09-01 00:00:00")
-              end=pd.Timestamp("2025-08-31 23:59:59")
-              span=(end-start).total_seconds()
-
-              signups=start + pd.to_timedelta(np.array(np.random.default_rng(7).uniform(0, span, size=N)), unit="s")
-              cust=pd.DataFrame({
-                  "CUSTOMER_ID": np.arange(1,N+1,dtype="int64"),
-                  "SIGNUP_UTC":  pd.to_datetime(signups),
-                  "COUNTRY":     np.random.default_rng(1).choice(["US","CA","UK"], size=N, p=[.84,.10,.06])
-              })
+              cust=pd.DataFrame({"CUSTOMER_ID":range(1,N+1),"SIGNUP_UTC":r(N),"COUNTRY":rng.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])})
               session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
 
               rows=[]; oid=1
-              k_per=np.clip(np.random.default_rng(3).poisson(1.4, size=N),0,6).astype(int)
-              for cid,k in zip(range(1,N+1), k_per):
+              for cid in range(1,N+1):
+                  k=int(np.clip(rng.poisson(1.4),0,6))
                   if k==0: continue
-                  times=np.sort(start + pd.to_timedelta(np.random.default_rng(cid%11+4).uniform(0, span, size=k), unit="s"))
-                  bsel =np.random.default_rng(5).choice(brands,   size=k, p=[.55,.30,.15])
-                  chsel=np.random.default_rng(6).choice(channels, size=k, p=[.45,.12,.18,.15,.06,.04])
-                  for t,b,c in zip(times,bsel,chsel):
+                  times=sorted(r(k))
+                  bsel=rng.choice(brands, size=k, p=[.55,.30,.15])
+                  ch  =rng.choice(channels, size=k, p=[.45,.12,.18,.15,.06,.04])
+                  for t,b,c in zip(times,bsel,ch):
                       base=120 if b=="JCREW" else 85 if b=="MADEWELL" else 70
-                      units=max(1, int(np.round(np.random.default_rng(8).gamma(2.0,0.8))))
-                      price=max(25.0, float(np.random.default_rng(9).normal(base,18)))
-                      rev=round(units*price,2)
-                      margin=round(rev * float(np.random.default_rng(10).uniform(0.48,0.63)),2)
-                      rows.append((oid,cid,pd.to_datetime(t),b,c,int(units),rev,margin)); oid+=1
+                      units=max(1, int(np.round(rng.gamma(2.0,0.8))))
+                      price=max(25, rng.normal(base,18))
+                      rev=round(units*price,2); margin=round(rev*rng.uniform(.48,.63),2)
+                      rows.append((oid,cid,str(t),b,c,units,rev,margin)); oid+=1
 
               df=pd.DataFrame(rows, columns=["ORDER_ID","CUSTOMER_ID","ORDER_UTC","BRAND","CHANNEL","UNITS","REVENUE","MARGIN"])
-              df["ORDER_ID"]=df["ORDER_ID"].astype("int64")
-              df["CUSTOMER_ID"]=df["CUSTOMER_ID"].astype("int64")
-              df["UNITS"]=df["UNITS"].astype("int64")
-              df["ORDER_UTC"]=pd.to_datetime(df["ORDER_UTC"])
               session.write_pandas(df, "FACT_ORDERS", auto_create_table=True, overwrite=True)
               return f"Loaded {len(df):,} orders for {N:,} customers."
           $$;
-          """)
 
-          # Views
-          exec("""
           CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
-          WITH first_ts AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
+          WITH f AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
           SELECT o.CUSTOMER_ID, o.BRAND AS FIRST_PURCHASE_BRAND, f.FIRST_ORDER_UTC
-          FROM FACT_ORDERS o JOIN first_ts f USING (CUSTOMER_ID)
+          FROM FACT_ORDERS o JOIN f USING (CUSTOMER_ID)
           WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
-          QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1
-          """)
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
 
-          exec("""
           CREATE OR REPLACE VIEW VW_BRAND_FLOWS_ANY AS
           SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
-          FROM FACT_ORDERS o JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID) GROUP BY 1,2
-          """)
+          FROM FACT_ORDERS o JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID) GROUP BY 1,2;
 
-          exec("""
           CREATE OR REPLACE VIEW VW_BRAND_FLOWS_SUBSEQ AS
-          WITH first_ts AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
+          WITH ft AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
           SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
-          FROM FACT_ORDERS o JOIN first_ts ft USING (CUSTOMER_ID) JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
-          WHERE o.ORDER_UTC > ft.FIRST_ORDER_UTC GROUP BY 1,2
-          """)
+          FROM FACT_ORDERS o JOIN ft USING (CUSTOMER_ID) JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
+          WHERE o.ORDER_UTC > ft.FIRST_ORDER_UTC GROUP BY 1,2;
 
-          exec("CALL GENERATE_DEMO_DATA()")
-          cs.close(); ctx.close()
+          CALL GENERATE_DEMO_DATA();
+          SQL
+
+          "$HOME/.snowsql/snowsql" -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" \
+            -r "$SNOWSQL_ROLE" -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" \
+            -f seed_and_views.sql
+
+      - name: Python fallback — install connector
+        if: steps.snowsql.outputs.ok != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ───────────────────────────────────────────────────────────────────────────
+      # FIX 2: Host-aware Python fallback to avoid 251001/251000 account issues
+      # ───────────────────────────────────────────────────────────────────────────
+      - name: Python fallback — run deploy script
+        if: steps.snowsql.outputs.ok != 'true'
+        env:
+          SNOW_HOST:            ${{ secrets.SNOW_HOST }}              # e.g., JZIPRSC-ISC01138.snowflakecomputing.com
+          SNOW_ACCOUNT:         ${{ secrets.SNOW_ACCOUNT }}           # e.g., jziprsc-isc01138
+          SNOWFLAKE_ACCOUNT:    ${{ secrets.SNOWFLAKE_ACCOUNT }}      # optional alias; same value if used
+          SNOW_USER:            ${{ secrets.SNOW_USER }}
+          SNOW_PASSWORD:        ${{ secrets.SNOW_PASSWORD }}
+          SNOW_ROLE:            ${{ secrets.SNOW_ROLE }}
+          SNOW_WAREHOUSE:       ${{ secrets.SNOW_WAREHOUSE }}
+          SNOW_DATABASE:        ${{ secrets.SNOW_DATABASE }}
+          SNOW_SCHEMA:          ${{ secrets.SNOW_SCHEMA }}
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install snowflake-connector-python pandas numpy
+
+          python - <<'PY'
+          import os
+          import snowflake.connector as sf
+
+          host = (os.getenv('SNOW_HOST') or '').strip()
+          acct = (os.getenv('SNOW_ACCOUNT') or os.getenv('SNOWFLAKE_ACCOUNT') or '').strip()
+
+          user = os.environ['SNOW_USER']
+          pwd  = os.environ['SNOW_PASSWORD']
+          role = os.environ['SNOW_ROLE']
+          wh   = os.environ['SNOW_WAREHOUSE']
+          db   = os.environ['SNOW_DATABASE']
+          sc   = os.environ['SNOW_SCHEMA']
+
+          # Build connection kwargs. Provide both host and account when available.
+          kwargs = dict(user=user, password=pwd, role=role, warehouse=wh, database=db, schema=sc)
+          if host:
+              kwargs['host'] = host
+          if acct:
+              kwargs['account'] = acct
+
+          if ('host' not in kwargs) and ('account' not in kwargs):
+              raise RuntimeError(
+                  "Snowflake account not provided. Set repo secret SNOW_ACCOUNT or SNOWFLAKE_ACCOUNT, "
+                  "or provide SNOW_HOST."
+              )
+
+          ctx = sf.connect(**kwargs)
+          cs = ctx.cursor()
+          try:
+              def exec(sql):
+                  print("SQL>", sql.splitlines()[0][:80], '...')
+                  cs.execute(sql)
+
+              # Bootstrap
+              exec(f"USE ROLE {role}")
+              exec(f"USE WAREHOUSE {wh}")
+              exec(f"USE DATABASE {db}")
+              exec(f"CREATE SCHEMA IF NOT EXISTS {sc}")
+              exec(f"USE SCHEMA {sc}")
+
+              exec("CREATE OR REPLACE TABLE DIM_BRAND (BRAND_ID INT, BRAND_CODE STRING)")
+              exec("CREATE OR REPLACE TABLE DIM_CHANNEL (CHANNEL_ID INT, CHANNEL_NAME STRING)")
+              exec("CREATE OR REPLACE TABLE DIM_CUSTOMER (CUSTOMER_ID INT, SIGNUP_UTC TIMESTAMP_NTZ, COUNTRY STRING)")
+              exec("CREATE OR REPLACE TABLE FACT_SESSIONS (SESSION_ID INT, CUSTOMER_ID INT, SESSION_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING)")
+              exec("CREATE OR REPLACE TABLE FACT_ORDERS (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING, UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2))")
+
+              sp = r'''
+              CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
+              RETURNS STRING
+              LANGUAGE PYTHON
+              RUNTIME_VERSION='3.10'
+              PACKAGES=('snowflake-snowpark-python','pandas','numpy')
+              HANDLER='run'
+              AS
+              $$
+              from snowflake.snowpark import Session
+              import pandas as pd, numpy as np
+              def run(session: Session) -> str:
+                  rng=np.random.default_rng(42)
+                  brands=["JCREW","FACTORY","MADEWELL"]
+                  channels=["Direct","Email","Paid Search","Social","Affiliate","Display"]
+                  session.create_dataframe(pd.DataFrame({"BRAND_ID":[1,2,3],"BRAND_CODE":brands})).write.mode("overwrite").save_as_table("DIM_BRAND")
+                  session.create_dataframe(pd.DataFrame({"CHANNEL_ID":range(1,7),"CHANNEL_NAME":channels})).write.mode("overwrite").save_as_table("DIM_CHANNEL")
+
+                  N=50000; start=pd.Timestamp("2024-09-01"); end=pd.Timestamp("2025-08-31")
+                  def r(n):
+                      d=(end-start).total_seconds()
+                      return [start + pd.Timedelta(seconds=float(np.random.uniform(0,d))) for _ in range(n)]
+
+                  cust=pd.DataFrame({"CUSTOMER_ID":range(1,N+1),"SIGNUP_UTC":r(N),"COUNTRY":np.random.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])})
+                  session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
+
+                  rows=[]; oid=1
+                  for cid in range(1,N+1):
+                      k=int(np.clip(np.random.poisson(1.4),0,6))
+                      if k==0: continue
+                      times=sorted(r(k))
+                      bsel=np.random.choice(["JCREW","FACTORY","MADEWELL"], size=k, p=[.55,.30,.15])
+                      ch  =np.random.choice(["Direct","Email","Paid Search","Social","Affiliate","Display"], size=k, p=[.45,.12,.18,.15,.06,.04])
+                      for t,b,c in zip(times,bsel,ch):
+                          base=120 if b=="JCREW" else 85 if b=="MADEWELL" else 70
+                          units=max(1, int(np.round(np.random.gamma(2.0,0.8))))
+                          price=max(25, np.random.normal(base,18))
+                          rev=round(units*price,2); margin=round(rev*np.random.uniform(.48,.63),2)
+                          rows.append((oid,cid,str(t),b,c,units,rev,margin)); oid+=1
+
+                  df=pd.DataFrame(rows, columns=["ORDER_ID","CUSTOMER_ID","ORDER_UTC","BRAND","CHANNEL","UNITS","REVENUE","MARGIN"])
+                  session.write_pandas(df, "FACT_ORDERS", auto_create_table=True, overwrite=True)
+                  return f"Loaded {len(df):,} orders for {N:,} customers."
+              $$;'''
+              exec(sp)
+
+              # Views
+              exec("""
+              CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
+              WITH f AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
+              SELECT o.CUSTOMER_ID, o.BRAND AS FIRST_PURCHASE_BRAND, f.FIRST_ORDER_UTC
+              FROM FACT_ORDERS o JOIN f USING (CUSTOMER_ID)
+              WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
+              QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
+              """)
+
+              exec("""
+              CREATE OR REPLACE VIEW VW_BRAND_FLOWS_ANY AS
+              SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
+              FROM FACT_ORDERS o JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID) GROUP BY 1,2;
+              """)
+
+              exec("""
+              CREATE OR REPLACE VIEW VW_BRAND_FLOWS_SUBSEQ AS
+              WITH ft AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
+              SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
+              FROM FACT_ORDERS o JOIN ft USING (CUSTOMER_ID) JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
+              WHERE o.ORDER_UTC > ft.FIRST_ORDER_UTC GROUP BY 1,2;
+              """)
+
+              exec("CALL GENERATE_DEMO_DATA()")
+          finally:
+              cs.close(); ctx.close()
           PY
