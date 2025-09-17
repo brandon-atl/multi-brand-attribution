@@ -90,106 +90,106 @@ jobs:
         run: |
           set -euxo pipefail
           cat > seed_and_views.sql <<'SQL'
-          CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
-          RETURNS STRING
-          LANGUAGE PYTHON
-          RUNTIME_VERSION='3.10'
-          PACKAGES=('snowflake-snowpark-python','pandas','numpy')
-          HANDLER='run'
-          AS
-          $$
-          from snowflake.snowpark import Session
-          import pandas as pd
-          import numpy as np
+CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION='3.10'
+PACKAGES=('snowflake-snowpark-python','pandas','numpy')
+HANDLER='run'
+AS
+$$
+from snowflake.snowpark import Session
+import pandas as pd
+import numpy as np
 
-          def run(session: Session) -> str:
-          rng = np.random.default_rng(42)
-          brands   = ["JCREW","FACTORY","MADEWELL"]
-          channels = ["Direct","Email","Paid Search","Social","Affiliate","Display"]
+def run(session: Session) -> str:
+    rng = np.random.default_rng(42)
+    brands   = ["JCREW","FACTORY","MADEWELL"]
+    channels = ["Direct","Email","Paid Search","Social","Affiliate","Display"]
 
-          session.create_dataframe(pd.DataFrame({"BRAND_ID":[1,2,3],"BRAND_CODE":brands})) \
-          .write.mode("overwrite").save_as_table("DIM_BRAND")
-          session.create_dataframe(pd.DataFrame({"CHANNEL_ID":list(range(1,7)),"CHANNEL_NAME":channels})) \
-          .write.mode("overwrite").save_as_table("DIM_CHANNEL")
+    session.create_dataframe(pd.DataFrame({"BRAND_ID":[1,2,3],"BRAND_CODE":brands})) \
+           .write.mode("overwrite").save_as_table("DIM_BRAND")
+    session.create_dataframe(pd.DataFrame({"CHANNEL_ID":list(range(1,7)),"CHANNEL_NAME":channels})) \
+           .write.mode("overwrite").save_as_table("DIM_CHANNEL")
 
-          N = 50000
-          start = pd.Timestamp("2024-09-01 00:00:00")
-          end   = pd.Timestamp("2025-08-31 23:59:59")
-          span  = (end - start).total_seconds()
+    N = 50000
+    start = pd.Timestamp("2024-09-01 00:00:00")
+    end   = pd.Timestamp("2025-08-31 23:59:59")
+    span  = (end - start).total_seconds()
 
-          signups = start + pd.to_timedelta(np.array(rng.uniform(0, span, size=N)), unit="s")
-          cust = pd.DataFrame({
-          "CUSTOMER_ID": np.arange(1, N+1, dtype="int64"),
-          "SIGNUP_UTC":  pd.to_datetime(signups),
-          "COUNTRY":     rng.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])
-          })
-          session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
+    signups = start + pd.to_timedelta(np.array(rng.uniform(0, span, size=N)), unit="s")
+    cust = pd.DataFrame({
+        "CUSTOMER_ID": np.arange(1, N+1, dtype="int64"),
+        "SIGNUP_UTC":  pd.to_datetime(signups),
+        "COUNTRY":     rng.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])
+    })
+    session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
 
-          rows = []
-          oid = 1
-          k_per = np.clip(rng.poisson(1.4, size=N), 0, 6).astype(int)
+    rows = []
+    oid = 1
+    k_per = np.clip(rng.poisson(1.4, size=N), 0, 6).astype(int)
 
-          for cid, k in zip(range(1, N+1), k_per):
-          if k == 0: continue
-          times = np.sort(start + pd.to_timedelta(rng.uniform(0, span, size=k), unit="s"))
-          bsel  = rng.choice(brands,   size=k, p=[.55,.30,.15])
-          chsel = rng.choice(channels, size=k, p=[.45,.12,.18,.15,.06,.04])
-          for t, b, c in zip(times, bsel, chsel):
-          base  = 120 if b=="JCREW" else 85 if b=="MADEWELL" else 70
-          units = max(1, int(np.round(rng.gamma(2.0, 0.8))))
-          price = max(25.0, float(rng.normal(base, 18)))
-          rev   = round(units * price, 2)
-          margin= round(rev * float(rng.uniform(0.48, 0.63)), 2)
-          rows.append((oid, cid, pd.to_datetime(t), b, c, int(units), rev, margin))
-          oid += 1
+    for cid, k in zip(range(1, N+1), k_per):
+        if k == 0: continue
+        times = np.sort(start + pd.to_timedelta(rng.uniform(0, span, size=k), unit="s"))
+        bsel  = rng.choice(brands,   size=k, p=[.55,.30,.15])
+        chsel = rng.choice(channels, size=k, p=[.45,.12,.18,.15,.06,.04])
+        for t, b, c in zip(times, bsel, chsel):
+            base  = 120 if b=="JCREW" else 85 if b=="MADEWELL" else 70
+            units = max(1, int(np.round(rng.gamma(2.0, 0.8))))
+            price = max(25.0, float(rng.normal(base, 18)))
+            rev   = round(units * price, 2)
+            margin= round(rev * float(rng.uniform(0.48, 0.63)), 2)
+            rows.append((oid, cid, pd.to_datetime(t), b, c, int(units), rev, margin))
+            oid += 1
 
-          df = pd.DataFrame(rows, columns=[
-          "ORDER_ID","CUSTOMER_ID","ORDER_UTC","BRAND","CHANNEL","UNITS","REVENUE","MARGIN"
-          ])
-          df["ORDER_ID"]    = df["ORDER_ID"].astype("int64")
-          df["CUSTOMER_ID"] = df["CUSTOMER_ID"].astype("int64")
-          df["UNITS"]       = df["UNITS"].astype("int64")
-          df["ORDER_UTC"]   = pd.to_datetime(df["ORDER_UTC"])
+    df = pd.DataFrame(rows, columns=[
+        "ORDER_ID","CUSTOMER_ID","ORDER_UTC","BRAND","CHANNEL","UNITS","REVENUE","MARGIN"
+    ])
+    df["ORDER_ID"]    = df["ORDER_ID"].astype("int64")
+    df["CUSTOMER_ID"] = df["CUSTOMER_ID"].astype("int64")
+    df["UNITS"]       = df["UNITS"].astype("int64")
+    df["ORDER_UTC"]   = pd.to_datetime(df["ORDER_UTC"])
 
-          session.write_pandas(df, "FACT_ORDERS", auto_create_table=True, overwrite=True)
-          return f"Loaded {len(df):,} orders for {N:,} customers."
-          $$;
+    session.write_pandas(df, "FACT_ORDERS", auto_create_table=True, overwrite=True)
+    return f"Loaded {len(df):,} orders for {N:,} customers."
+$$;
 
-          CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
-          WITH first_ts AS (
-          SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC
-          FROM FACT_ORDERS
-          GROUP BY 1
-          )
-          SELECT
-          o.CUSTOMER_ID,
-          o.BRAND AS FIRST_PURCHASE_BRAND,
-          f.FIRST_ORDER_UTC
-          FROM FACT_ORDERS o
-          JOIN first_ts f USING (CUSTOMER_ID)
-          WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
-          QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
+CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
+WITH first_ts AS (
+  SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC
+  FROM FACT_ORDERS
+  GROUP BY 1
+)
+SELECT
+  o.CUSTOMER_ID,
+  o.BRAND AS FIRST_PURCHASE_BRAND,
+  f.FIRST_ORDER_UTC
+FROM FACT_ORDERS o
+JOIN first_ts f USING (CUSTOMER_ID)
+WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
+QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
 
-          CREATE OR REPLACE VIEW VW_BRAND_FLOWS_ANY AS
-          SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
-          FROM FACT_ORDERS o JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
-          GROUP BY 1,2;
+CREATE OR REPLACE VIEW VW_BRAND_FLOWS_ANY AS
+SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
+FROM FACT_ORDERS o JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
+GROUP BY 1,2;
 
-          CREATE OR REPLACE VIEW VW_BRAND_FLOWS_SUBSEQ AS
-          WITH first_ts AS (
-          SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC
-          FROM FACT_ORDERS
-          GROUP BY 1
-          )
-          SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
-          FROM FACT_ORDERS o
-          JOIN first_ts ft USING (CUSTOMER_ID)
-          JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
-          WHERE o.ORDER_UTC > ft.FIRST_ORDER_UTC
-          GROUP BY 1,2;
+CREATE OR REPLACE VIEW VW_BRAND_FLOWS_SUBSEQ AS
+WITH first_ts AS (
+  SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC
+  FROM FACT_ORDERS
+  GROUP BY 1
+)
+SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
+FROM FACT_ORDERS o
+JOIN first_ts ft USING (CUSTOMER_ID)
+JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
+WHERE o.ORDER_UTC > ft.FIRST_ORDER_UTC
+GROUP BY 1,2;
 
-          CALL GENERATE_DEMO_DATA();
-          SQL
+CALL GENERATE_DEMO_DATA();
+SQL
 
           "$HOME/.snowsql/snowsql" -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" \
             -r "$SNOWSQL_ROLE" -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -s "$SNOWSQL_SCHEMA" \
