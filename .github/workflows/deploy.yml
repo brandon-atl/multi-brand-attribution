@@ -117,7 +117,6 @@ jobs:
           HANDLER = 'run'
           AS
           $$
-          from snowflake.snowpark import Session
           import pandas as pd, numpy as np
 
           def run(session: Session) -> str:
@@ -313,7 +312,6 @@ jobs:
               HANDLER='run'
               AS
               $$
-              from snowflake.snowpark import Session
               import pandas as pd, numpy as np
               def run(session: Session) -> str:
                   rng=np.random.default_rng(42)
