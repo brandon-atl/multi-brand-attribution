@@ -24,30 +24,28 @@ jobs:
       # Preflight: Patch Python UDFs
       # - Strip Snowpark imports from any UDFs (unsupported in UDF runtime)
       # - Add RUNTIME_VERSION and PACKAGES=('pandas','numpy') if imported in UDF code
+      # - Also: Dedent Python code inside $$ blocks for both UDFs and SPs in repo SQL
       # ───────────────────────────────────────────────────────────────────────────
       - name: Patch Python UDFs (remove Snowpark imports, add PACKAGES)
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Run UDF patcher
+      - name: Run UDF/SP patcher (strip UDF Snowpark, ensure opts, dedent $$ code)
         shell: bash
         run: |
           set -euxo pipefail
           python - <<'PY'
           import re, sys, subprocess
           from pathlib import Path
+          from textwrap import dedent as _dedent
 
-          UDF_RE = re.compile(
-              r'(?is)'
-              r'(CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b.*?\bLANGUAGE\s+PYTHON\b)'
-              r'(?P<opts>.*?)'
-              r'(?P<as>AS\s+\$\$)'
-              r'(?P<code>.*?)'
-              r'(\$\$;)'
-          )
+          # Regex to capture CREATE FUNCTION/PROCEDURE ... LANGUAGE PYTHON ... AS $$ <code> $$;
+          UDF_RE  = re.compile(r'(?is)(CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b.*?\bLANGUAGE\s+PYTHON\b)(?P<opts>.*?)(?P<as>AS\s+\$\$)(?P<code>.*?)(\$\$;)', re.DOTALL)
+          PROC_RE = re.compile(r'(?is)(CREATE\s+(?:OR\s+REPLACE\s+)?PROCEDURE\b.*?\bLANGUAGE\s+PYTHON\b)(?P<opts>.*?)(?P<as>AS\s+\$\$)(?P<code>.*?)(\$\$;)', re.DOTALL)
 
-          def strip_snowpark_imports(code: str) -> str:
+          def strip_snowpark_imports_for_udf(code: str) -> str:
+              # Remove Snowpark imports and Session annotations for UDFs (Snowpark unsupported in UDF runtime)
               code = re.sub(
                   r'(?m)^\s*(?:from\s+snowflake\.snowpark\s+import\b.*|import\s+snowflake\.snowpark(?:\s+as\s+\w+)?\b.*)\s*$',
                   '',
@@ -56,7 +54,7 @@ jobs:
               code = re.sub(r':\s*Session\b', ': object', code)
               return code
 
-          def ensure_opts(opts: str, code: str) -> str:
+          def ensure_udf_opts(opts: str, code: str) -> str:
               new_opts = opts
               if re.search(r'(?i)\bRUNTIME_VERSION\b', new_opts) is None:
                   new_opts += "\n  RUNTIME_VERSION = '3.10'"
@@ -80,23 +78,39 @@ jobs:
                       new_opts = re.sub(r'(?i)\bPACKAGES\s*=\s*\((.*?)\)', f"PACKAGES = ({new_pkgs})", new_opts, 1)
               return new_opts
 
+          def dedent_code_block(code: str) -> str:
+              # Normalize indentation for Python interpreter inside Snowflake
+              return _dedent(code).lstrip('\n').rstrip() + "\n"
+
           def patch_file(path: Path) -> bool:
               s = path.read_text(encoding="utf-8", errors="ignore")
               changed = False
 
-              def _patch(m: re.Match) -> str:
+              def _patch_udf(m: re.Match) -> str:
                   nonlocal changed
                   head, opts, as_tok, code = m.group(1), m.group("opts"), m.group("as"), m.group("code")
-                  code2 = strip_snowpark_imports(code)
-                  opts2 = ensure_opts(opts, code2)
+                  code2 = strip_snowpark_imports_for_udf(code)
+                  code2 = dedent_code_block(code2)
+                  opts2 = ensure_udf_opts(opts, code2)
                   if code2 != code or opts2 != opts:
                       changed = True
                   return head + opts2 + "\n" + as_tok + code2 + "$$;"
 
-              new_s = re.sub(UDF_RE, _patch, s)
+              def _patch_proc(m: re.Match) -> str:
+                  nonlocal changed
+                  head, opts, as_tok, code = m.group(1), m.group("opts"), m.group("as"), m.group("code")
+                  code2 = dedent_code_block(code)
+                  if code2 != code:
+                      changed = True
+                  return head + opts + "\n" + as_tok + code2 + "$$;"
+
+              new_s = s
+              new_s = re.sub(UDF_RE, _patch_udf, new_s)
+              new_s = re.sub(PROC_RE, _patch_proc, new_s)
+
               if changed and new_s != s:
                   path.write_text(new_s, encoding="utf-8")
-                  print(f"Patched UDFs in: {path}")
+                  print(f"Patched Python blocks in: {path}")
                   return True
               return False
 
@@ -108,7 +122,7 @@ jobs:
                   return list(Path(".").rglob("*.sql"))
 
           modified = [str(p) for p in collect_sql_files() if patch_file(p)]
-          print("Patched files:" if modified else "No UDF patches needed.", modified)
+          print("Patched files:" if modified else "No UDF/SP patches needed.", modified)
           PY
 
       # ───────────────────────────────────────────────────────────────────────────
@@ -142,82 +156,6 @@ jobs:
       # Bootstrap (tables only): matches the four tables in your Snowpark worksheet
       # ───────────────────────────────────────────────────────────────────────────
       - name: Bootstrap via SnowSQL
-        if: steps.snowsql.outputs.ok == 'true'
-        env:
-          SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
-          SNOWSQL_USER:      ${{ secrets.SNOW_USER }}
-          SNOWSQL_PWD:       ${{ secrets.SNOW_PASSWORD }}
-          SNOWSQL_ROLE:      ${{ secrets.SNOW_ROLE }}
-          SNOWSQL_WAREHOUSE: ${{ secrets.SNOW_WAREHOUSE }}
-          SNOWSQL_DATABASE:  ${{ secrets.SNOW_DATABASE }}
-          SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
-        run: |
-          set -euxo pipefail
-          cat > bootstrap.sql <<SQL
-          USE ROLE ${SNOWSQL_ROLE};
-          USE WAREHOUSE ${SNOWSQL_WAREHOUSE};
-          USE DATABASE ${SNOWSQL_DATABASE};
-          CREATE SCHEMA IF NOT EXISTS ${SNOWSQL_SCHEMA};
-          USE SCHEMA ${SNOWSQL_SCHEMA};
-
-          CREATE OR REPLACE TABLE DIM_BRAND (
-            BRAND_ID INT,
-            BRAND_CODE STRING
-          );
-
-          CREATE OR REPLACE TABLE DIM_CHANNEL (
-            CHANNEL_ID INT,
-            CHANNEL_NAME STRING
-          );
-
-          CREATE OR REPLACE TABLE DIM_CUSTOMER (
-            CUSTOMER_ID INT,
-            SIGNUP_UTC TIMESTAMP_NTZ,
-            COUNTRY STRING
-          );
-
-          CREATE OR REPLACE TABLE FACT_ORDERS (
-            ORDER_ID INT,
-            CUSTOMER_ID INT,
-            ORDER_UTC TIMESTAMP_NTZ,
-            BRAND STRING,
-            CHANNEL STRING,
-            UNITS NUMBER(9,0),
-            REVENUE NUMBER(12,2),
-            MARGIN NUMBER(12,2)
-          );
-          SQL
-
-          "$HOME/.snowsql/snowsql" \
-            -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" \
-            -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f bootstrap.sql
-
-      # ───────────────────────────────────────────────────────────────────────────
-      # Deploy repo SQL (after patching) — if you keep SQL files in repo
-      # ───────────────────────────────────────────────────────────────────────────
-      - name: Deploy repo SQL (patched UDFs)
-        if: steps.snowsql.outputs.ok == 'true'
-        env:
-          SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
-          SNOWSQL_USER:      ${{ secrets.SNOW_USER }}
-          SNOWSQL_PWD:       ${{ secrets.SNOW_PASSWORD }}
-          SNOWSQL_ROLE:      ${{ secrets.SNOW_ROLE }}
-          SNOWSQL_WAREHOUSE: ${{ secrets.SNOW_WAREHOUSE }}
-          SNOWSQL_DATABASE:  ${{ secrets.SNOW_DATABASE }}
-          SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
-        run: |
-          set -euxo pipefail
-          while IFS= read -r f; do
-            echo ">>> Running $f"
-            "$HOME/.snowsql/snowsql" \
-              -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" \
-              -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f "$f"
-          done < <(git ls-files '*.sql' | sort)
-
-      # ───────────────────────────────────────────────────────────────────────────
-      # Seed data via Snowpark STORED PROCEDURE (pandas/numpy OK), then create views
-      # ───────────────────────────────────────────────────────────────────────────
-      - name: Seed + Views (Snowpark SP + views)
         if: steps.snowsql.outputs.ok == 'true'
         env:
           SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
@@ -356,15 +294,52 @@ jobs:
           CALL GENERATE_DEMO_DATA();
           SQL
 
+          # Replace template variables
           sed -i "s/\${SNOWSQL_ROLE}/${SNOWSQL_ROLE}/g"           seed_and_views.sql
           sed -i "s/\${SNOWSQL_WAREHOUSE}/${SNOWSQL_WAREHOUSE}/g" seed_and_views.sql
           sed -i "s/\${SNOWSQL_DATABASE}/${SNOWSQL_DATABASE}/g"   seed_and_views.sql
           sed -i "s/\${SNOWSQL_SCHEMA}/${SNOWSQL_SCHEMA}/g"       seed_and_views.sql
 
+          # Dedent Python code inside $$ ... $$ blocks to avoid IndentationError
+          awk '
+            BEGIN{in=0}
+            /^[[:space:]]*\$\$[[:space:]]*$/ { in=1; print "$$"; next }
+            /^[[:space:]]*\$\$;[[:space:]]*$/ { in=0; print "$$;"; next }
+            {
+              if (in==1) {
+                sub(/^[[:space:]]+/, "", $0)
+              }
+              print
+            }
+          ' seed_and_views.sql > seed_and_views.dedented.sql
+          mv seed_and_views.dedented.sql seed_and_views.sql
+
           "$HOME/.snowsql/snowsql" \
             -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" \
             -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" \
             -f seed_and_views.sql
+
+      # ───────────────────────────────────────────────────────────────────────────
+      # Deploy repo SQL (after patching) — if you keep SQL files in repo
+      # ───────────────────────────────────────────────────────────────────────────
+      - name: Deploy repo SQL (patched UDFs/SPs)
+        if: steps.snowsql.outputs.ok == 'true'
+        env:
+          SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
+          SNOWSQL_USER:      ${{ secrets.SNOW_USER }}
+          SNOWSQL_PWD:       ${{ secrets.SNOW_PASSWORD }}
+          SNOWSQL_ROLE:      ${{ secrets.SNOW_ROLE }}
+          SNOWSQL_WAREHOUSE: ${{ secrets.SNOW_WAREHOUSE }}
+          SNOWSQL_DATABASE:  ${{ secrets.SNOW_DATABASE }}
+          SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
+        run: |
+          set -euxo pipefail
+          while IFS= read -r f; do
+            echo ">>> Running $f"
+            "$HOME/.snowsql/snowsql" \
+              -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" \
+              -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f "$f"
+          done < <(git ls-files '*.sql' | sort)
 
       # ───────────────────────────────────────────────────────────────────────────
       # Python fallback (if SnowSQL unavailable): also creates SP, calls it, then views
@@ -393,7 +368,7 @@ jobs:
           python -m pip install snowflake-connector-python pandas numpy
 
           python - <<'PY'
-          import os, snowflake.connector as sf
+          import os, textwrap, snowflake.connector as sf
           acct=(os.getenv('SNOW_ACCOUNT') or os.getenv('SNOWFLAKE_ACCOUNT') or '').strip()
           host=(os.getenv('SNOW_HOST') or '').strip()
           user=os.environ['SNOW_USER']; pwd=os.environ['SNOW_PASSWORD']
@@ -406,7 +381,9 @@ jobs:
               raise RuntimeError("Provide SNOW_ACCOUNT (or SNOWFLAKE_ACCOUNT) or SNOW_HOST.")
           ctx=sf.connect(**kw); cs=ctx.cursor()
           try:
-              def exec(sql): print("SQL>", sql.splitlines()[0][:120], "..."); cs.execute(sql)
+              def exec(sql): 
+                  print("SQL>", sql.splitlines()[0][:120], "...")
+                  cs.execute(sql)
 
               exec(f"USE ROLE {role}")
               exec(f"USE WAREHOUSE {wh}")
@@ -422,8 +399,8 @@ jobs:
                         ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ,
                         BRAND STRING, CHANNEL STRING, UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2))""")
 
-              # Create Snowpark SP (Snowpark runs inside SP; OK to import)
-              sp = r"""
+              # Create Snowpark SP (dedented so Python interpreter doesn't crash)
+              sp = textwrap.dedent(r"""
               CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
               RETURNS STRING
               LANGUAGE PYTHON
@@ -482,7 +459,7 @@ jobs:
                   total_orders = int(session.sql("SELECT COUNT(*) FROM FACT_ORDERS").collect()[0][0])
                   return f"Generated {total_orders:,} orders across {N:,} customers into FACT_ORDERS."
               $$;
-              """
+              """)
               exec(sp)
 
               # Views (identical logic)
