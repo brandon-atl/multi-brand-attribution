@@ -1,8 +1,10 @@
 name: Deploy to Snowflake
 
-on:
-  push: { branches: [ "main" ] }
-  workflow_dispatch: {}
+'on':
+  push:
+    branches:
+      - main
+  workflow_dispatch:
 
 jobs:
   deploy:
@@ -18,121 +20,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ca-certificates curl libffi-dev libssl-dev
 
-      # ───────────────────────────────────────────────────────────────────────────
-      # Preflight: Patch Python UDFs to declare PACKAGES (pandas/numpy) when used;
-      #            fail fast if any UDF imports snowflake.snowpark (unsupported in UDFs)
-      #            ⚠️ Fixed to avoid "nonlocal changed" SyntaxError
-      # ───────────────────────────────────────────────────────────────────────────
-      - name: Patch Python UDFs (add PACKAGES, block Snowpark)
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Run UDF patcher (fixed: no 'nonlocal' usage)
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          import re, sys, subprocess
-          from pathlib import Path
-
-          # Regex to match Python UDFs in .sql files:
-          #   CREATE [OR REPLACE] FUNCTION ... LANGUAGE PYTHON <opts> AS $$ <code> $$;
-          UDF_RE = re.compile(
-              r'(?is)'  # case-insensitive, dotall
-              r'(CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b.*?\bLANGUAGE\s+PYTHON\b)'  # head through "LANGUAGE PYTHON"
-              r'(?P<opts>.*?)'     # options (between LANGUAGE and AS $$)
-              r'(?P<as>AS\s+\$\$)' # the "AS $$" token
-              r'(?P<code>.*?)'     # handler body
-              r'(\$\$;)'           # end marker
-          )
-
-          def process_file(path: Path) -> bool:
-              """Patch a single .sql file. Returns True if modified."""
-              s = path.read_text(encoding="utf-8", errors="ignore")
-
-              # mutable flag (avoids needing 'nonlocal')
-              changed = [False]
-
-              def patch(m: re.Match) -> str:
-                  opts, code = m.group("opts"), m.group("code")
-
-                  # Guard: Snowpark inside a UDF is not supported — require a Python SPROC instead.
-                  if re.search(r'(?i)\bfrom\s+snowflake\.snowpark\b|\bimport\s+snowflake\.snowpark\b', code):
-                      print(
-                          f"ERROR: {path} contains a Python UDF that imports snowflake.snowpark. "
-                          f"Move that logic to a Python stored procedure (Snowpark is supported there).",
-                          file=sys.stderr
-                      )
-                      sys.exit(2)
-
-                  needs_pandas = re.search(r'(?i)\b(from|import)\s+pandas\b', code) is not None
-                  needs_numpy  = re.search(r'(?i)\b(from|import)\s+numpy\b',  code) is not None
-
-                  new_opts = opts
-
-                  # Ensure RUNTIME_VERSION is present
-                  if re.search(r'(?i)\bRUNTIME_VERSION\b', new_opts) is None:
-                      new_opts += "\n  RUNTIME_VERSION = '3.10'"
-
-                  # Ensure PACKAGES includes pandas/numpy if imported in the UDF code
-                  if needs_pandas or needs_numpy:
-                      pkg_m = re.search(r'(?i)\bPACKAGES\s*=\s*\((.*?)\)', new_opts)
-                      if pkg_m is None:
-                          pkgs = []
-                          if needs_pandas: pkgs.append("'pandas'")
-                          if needs_numpy:  pkgs.append("'numpy'")
-                          new_opts += f"\n  PACKAGES = ({', '.join(pkgs)})"
-                      else:
-                          pkgs_text = pkg_m.group(1)
-                          pkgs_set = {
-                              p.strip().strip("'").strip('"')
-                              for p in pkgs_text.split(",") if p.strip()
-                          }
-                          if needs_pandas: pkgs_set.add("pandas")
-                          if needs_numpy:  pkgs_set.add("numpy")
-                          new_pkgs = ", ".join(sorted(f"'{p}'" for p in pkgs_set))
-                          new_opts = re.sub(
-                              r'(?i)\bPACKAGES\s*=\s*\((.*?)\)',
-                              f"PACKAGES = ({new_pkgs})",
-                              new_opts,
-                              count=1
-                          )
-
-                  if new_opts != opts:
-                      changed[0] = True
-
-                  return m.group(1) + new_opts + "\n" + m.group("as") + code + "$$;"
-
-              new_s = re.sub(UDF_RE, patch, s)
-
-              if changed[0] and new_s != s:
-                  path.write_text(new_s, encoding="utf-8")
-                  return True
-              return False
-
-          def main():
-              # Collect tracked .sql files; fall back to recursive glob if needed
-              try:
-                  out = subprocess.check_output(["git", "ls-files", "*.sql"], text=True).strip().splitlines()
-                  sql_files = [Path(p) for p in out]
-              except Exception:
-                  sql_files = list(Path(".").rglob("*.sql"))
-
-              modified = [str(p) for p in sql_files if process_file(p)]
-              print("Patched UDF files:" if modified else "No Python UDFs needed patching.", modified)
-
-          if __name__ == "__main__":
-              main()
-          PY
-
-      # ───────────────────────────────────────────────────────────────────────────
-      # Install SnowSQL (proper major.minor bootstrap path)
-      # ───────────────────────────────────────────────────────────────────────────
+      # Install SnowSQL
       - name: Install SnowSQL (with logs)
         id: snowsql
         continue-on-error: true
         env:
-          SNOWSQL_VERSION: "1.2.31"   # update to a newer 1.2.x if desired
+          SNOWSQL_VERSION: "1.2.31"
         run: |
           set -euxo pipefail
           curl -fsSL \
@@ -141,20 +34,17 @@ jobs:
           bash snowsql.bash -y > snowsql_install.log 2>&1 || true
           SNOWSQL_BIN="$HOME/.snowsql/snowsql"
           if [ -x "$SNOWSQL_BIN" ]; then
-            echo "ok=true" >> $GITHUB_OUTPUT
+            echo "ok=true" >> "$GITHUB_OUTPUT"
             "$SNOWSQL_BIN" --version || true
           else
-            echo "ok=false" >> $GITHUB_OUTPUT
-            echo "==== SnowSQL install log (tail) ===="
+            echo "ok=false" >> "$GITHUB_OUTPUT"
             tail -200 snowsql_install.log || true
           fi
 
       - name: Show decision
         run: echo "SnowSQL available? -> ${{ steps.snowsql.outputs.ok }}"
 
-      # ───────────────────────────────────────────────────────────────────────────
-      # Bootstrap core objects via SnowSQL
-      # ───────────────────────────────────────────────────────────────────────────
+      # Bootstrap core objects
       - name: Bootstrap via SnowSQL
         if: steps.snowsql.outputs.ok == 'true'
         env:
@@ -190,10 +80,8 @@ jobs:
             -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" \
             -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f bootstrap.sql
 
-      # ───────────────────────────────────────────────────────────────────────────
-      # Deploy repo SQL (now patched) — this will create UDFs safely
-      # ───────────────────────────────────────────────────────────────────────────
-      - name: Deploy repo SQL (patched UDFs)
+      # Deploy SP (Snowpark OK), safe UDFs (no Snowpark), and views
+      - name: Seed + Views via SnowSQL
         if: steps.snowsql.outputs.ok == 'true'
         env:
           SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
@@ -205,36 +93,12 @@ jobs:
           SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
         run: |
           set -euxo pipefail
-          mapfile -t FILES < <(git ls-files '*.sql' | sort)
-          for f in "${FILES[@]}"; do
-            echo ">>> Running $f"
-            "$HOME/.snowsql/snowsql" \
-              -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" \
-              -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f "$f"
-          done
-
-      # ───────────────────────────────────────────────────────────────────────────
-      # (Optional) Demo data + analytics views using a Snowpark stored procedure
-      # ───────────────────────────────────────────────────────────────────────────
-      - name: Seed + Views (Snowpark SP + views)
-        if: steps.snowsql.outputs.ok == 'true'
-        env:
-          SNOWSQL_ACCOUNT:   ${{ secrets.SNOW_ACCOUNT }}
-          SNOWSQL_USER:      ${{ secrets.SNOW_USER }}
-          SNOWSQL_PWD:       ${{ secrets.SNOW_PASSWORD }}
-          SNOWSQL_ROLE:      ${{ secrets.SNOW_ROLE }}
-          SNOWSQL_WAREHOUSE: ${{ secrets.SNOW_WAREHOUSE }}
-          SNOWSQL_DATABASE:  ${{ secrets.SNOW_DATABASE }}
-          SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
-        run: |
-          set -euxo pipefail
-          cat > seed_and_views.sql <<'SQL'
+          cat > seed_and_views.sql <<SQL
           USE ROLE ${SNOWSQL_ROLE};
           USE WAREHOUSE ${SNOWSQL_WAREHOUSE};
           USE DATABASE ${SNOWSQL_DATABASE};
           USE SCHEMA ${SNOWSQL_SCHEMA};
 
-          -- Snowpark is supported in Python STORED PROCEDURES; ok to use pandas/numpy here.
           CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
           RETURNS STRING
           LANGUAGE PYTHON
@@ -261,13 +125,13 @@ jobs:
 
               N = 50000
               start = pd.Timestamp("2024-09-01"); end = pd.Timestamp("2025-08-31")
-              def random_times(n):
+              def r(n):
                   d = (end-start).total_seconds()
                   return [start + pd.Timedelta(seconds=float(rng.uniform(0, d))) for _ in range(n)]
 
               cust = pd.DataFrame({
                   "CUSTOMER_ID": range(1, N+1),
-                  "SIGNUP_UTC":  random_times(N),
+                  "SIGNUP_UTC":  r(N),
                   "COUNTRY":     rng.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])
               })
               session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
@@ -276,7 +140,7 @@ jobs:
               for cid in range(1,N+1):
                   k = int(np.clip(rng.poisson(1.4), 0, 6))
                   if k == 0: continue
-                  times = sorted(random_times(k))
+                  times = sorted(r(k))
                   bsel  = rng.choice(brands,   size=k, p=[.55,.30,.15])
                   chsel = rng.choice(channels, size=k, p=[.45,.12,.18,.15,.06,.04])
                   for t, b, c in zip(times, bsel, chsel):
@@ -285,8 +149,7 @@ jobs:
                       price = max(25, rng.normal(base, 18))
                       rev   = round(units * price, 2)
                       marg  = round(rev * rng.uniform(.48, .63), 2)
-                      rows.append((oid, cid, str(t), b, c, units, rev, marg))
-                      oid += 1
+                      rows.append((oid, cid, str(t), b, c, units, rev, marg)); oid += 1
 
               df = pd.DataFrame(rows, columns=[
                 "ORDER_ID","CUSTOMER_ID","ORDER_UTC","BRAND","CHANNEL","UNITS","REVENUE","MARGIN"
@@ -295,14 +158,15 @@ jobs:
               return f"Loaded {len(df):,} orders for {N:,} customers."
           $$;
 
-          -- Example views
           CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
           WITH f AS (
             SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC
             FROM FACT_ORDERS
             GROUP BY 1
           )
-          SELECT o.CUSTOMER_ID, o.BRAND AS FIRST_PURCHASE_BRAND, f.FIRST_ORDER_UTC
+          SELECT o.CUSTOMER_ID,
+                 o.BRAND AS FIRST_PURCHASE_BRAND,
+                 f.FIRST_ORDER_UTC
           FROM FACT_ORDERS o
           JOIN f USING (CUSTOMER_ID)
           WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
@@ -336,32 +200,23 @@ jobs:
           CALL GENERATE_DEMO_DATA();
           SQL
 
-          # Inject env vars into the SQL above (placeholders are literal)
-          sed -i "s/\${SNOWSQL_ROLE}/${SNOWSQL_ROLE}/g"         seed_and_views.sql
-          sed -i "s/\${SNOWSQL_WAREHOUSE}/${SNOWSQL_WAREHOUSE}/g" seed_and_views.sql
-          sed -i "s/\${SNOWSQL_DATABASE}/${SNOWSQL_DATABASE}/g"   seed_and_views.sql
-          sed -i "s/\${SNOWSQL_SCHEMA}/${SNOWSQL_SCHEMA}/g"       seed_and_views.sql
-
           "$HOME/.snowsql/snowsql" \
             -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" \
-            -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" \
-            -f seed_and_views.sql
+            -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f seed_and_views.sql
 
-      # ───────────────────────────────────────────────────────────────────────────
       # Python fallback (when SnowSQL cannot be installed)
-      # ───────────────────────────────────────────────────────────────────────────
-      - name: Python fallback — install connector
+      - name: Python fallback - install connector
         if: steps.snowsql.outputs.ok != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Python fallback — run deploy script
+      - name: Python fallback - run deploy script
         if: steps.snowsql.outputs.ok != 'true'
         env:
-          SNOW_HOST:            ${{ secrets.SNOW_HOST }}          # optional host
-          SNOW_ACCOUNT:         ${{ secrets.SNOW_ACCOUNT }}       # e.g., xy12345
-          SNOWFLAKE_ACCOUNT:    ${{ secrets.SNOWFLAKE_ACCOUNT }}  # alias (optional)
+          SNOW_HOST:            ${{ secrets.SNOW_HOST }}
+          SNOW_ACCOUNT:         ${{ secrets.SNOW_ACCOUNT }}
+          SNOWFLAKE_ACCOUNT:    ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOW_USER:            ${{ secrets.SNOW_USER }}
           SNOW_PASSWORD:        ${{ secrets.SNOW_PASSWORD }}
           SNOW_ROLE:            ${{ secrets.SNOW_ROLE }}
@@ -374,13 +229,18 @@ jobs:
           python -m pip install snowflake-connector-python pandas numpy
 
           python - <<'PY'
-          import os, snowflake.connector as sf
+          import os
+          import snowflake.connector as sf
 
           host = (os.getenv('SNOW_HOST') or '').strip()
           acct = (os.getenv('SNOW_ACCOUNT') or os.getenv('SNOWFLAKE_ACCOUNT') or '').strip()
-          user = os.environ['SNOW_USER']; pwd  = os.environ['SNOW_PASSWORD']
-          role = os.environ['SNOW_ROLE']; wh   = os.environ['SNOW_WAREHOUSE']
-          db   = os.environ['SNOW_DATABASE']; sc = os.environ['SNOW_SCHEMA']
+
+          user = os.environ['SNOW_USER']
+          pwd  = os.environ['SNOW_PASSWORD']
+          role = os.environ['SNOW_ROLE']
+          wh   = os.environ['SNOW_WAREHOUSE']
+          db   = os.environ['SNOW_DATABASE']
+          sc   = os.environ['SNOW_SCHEMA']
 
           kwargs = dict(user=user, password=pwd, role=role, warehouse=wh, database=db, schema=sc)
           if host: kwargs['host'] = host
@@ -395,7 +255,6 @@ jobs:
                   print("SQL>", sql.splitlines()[0][:100], "...")
                   cs.execute(sql)
 
-              # Scope & base objects
               exec(f"USE ROLE {role}")
               exec(f"USE WAREHOUSE {wh}")
               exec(f"USE DATABASE {db}")
@@ -408,7 +267,6 @@ jobs:
               exec("CREATE OR REPLACE TABLE FACT_SESSIONS (SESSION_ID INT, CUSTOMER_ID INT, SESSION_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING)")
               exec("CREATE OR REPLACE TABLE FACT_ORDERS (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING, UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2))")
 
-              # Snowpark is supported in Python STORED PROCEDURES; ok to use pandas/numpy there.
               sp = r'''
               CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
               RETURNS STRING
@@ -455,7 +313,6 @@ jobs:
               $$;'''
               exec(sp)
 
-              # Views
               exec("""
               CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
               WITH f AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
