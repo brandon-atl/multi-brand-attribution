@@ -19,102 +19,120 @@ jobs:
           sudo apt-get install -y --no-install-recommends ca-certificates curl libffi-dev libssl-dev
 
       # ───────────────────────────────────────────────────────────────────────────
-      # Preflight: Patch Python UDFs to declare PACKAGES for pandas/numpy;
-      #            fail fast if any UDF imports snowflake.snowpark
+      # Preflight: Patch Python UDFs to declare PACKAGES (pandas/numpy) when used;
+      #            fail fast if any UDF imports snowflake.snowpark (unsupported in UDFs)
+      #            ⚠️ Fixed to avoid "nonlocal changed" SyntaxError
       # ───────────────────────────────────────────────────────────────────────────
       - name: Patch Python UDFs (add PACKAGES, block Snowpark)
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Run UDF patcher
+
+      - name: Run UDF patcher (fixed: no 'nonlocal' usage)
         run: |
           set -euxo pipefail
           python - <<'PY'
-          import re, sys
+          import re, sys, subprocess
           from pathlib import Path
 
-          # Scan all tracked SQL files for Python UDFs
-          sql_files = []
-          # Prefer tracked files (honors .gitignore) if available; fall back to glob.
-          try:
-              import subprocess
-              out = subprocess.check_output(["git", "ls-files", "*.sql"], text=True).strip().splitlines()
-              sql_files = [Path(p) for p in out]
-          except Exception:
-              sql_files = list(Path(".").rglob("*.sql"))
-
+          # Regex to match Python UDFs in .sql files:
+          #   CREATE [OR REPLACE] FUNCTION ... LANGUAGE PYTHON <opts> AS $$ <code> $$;
           UDF_RE = re.compile(
-              r'(?is)'                                   # flags
-              r'(CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b.*?\bLANGUAGE\s+PYTHON\b)'  # g1: head through "LANGUAGE PYTHON"
-              r'(?P<opts>.*?)'                           # options between LANGUAGE and AS $$
-              r'(?P<as>AS\s+\$\$)'                       # g: AS $$
-              r'(?P<code>.*?)'                           # code body
-              r'(\$\$;)'                                 # end marker
+              r'(?is)'  # case-insensitive, dotall
+              r'(CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\b.*?\bLANGUAGE\s+PYTHON\b)'  # head through "LANGUAGE PYTHON"
+              r'(?P<opts>.*?)'     # options (between LANGUAGE and AS $$)
+              r'(?P<as>AS\s+\$\$)' # the "AS $$" token
+              r'(?P<code>.*?)'     # handler body
+              r'(\$\$;)'           # end marker
           )
 
-          modified = []
-          for path in sql_files:
+          def process_file(path: Path) -> bool:
+              """Patch a single .sql file. Returns True if modified."""
               s = path.read_text(encoding="utf-8", errors="ignore")
-              changed = False
+
+              # mutable flag (avoids needing 'nonlocal')
+              changed = [False]
 
               def patch(m: re.Match) -> str:
-                  nonlocal changed
                   opts, code = m.group("opts"), m.group("code")
 
-                  # Guard: Snowpark inside a UDF is not supported; require SPROC instead.
+                  # Guard: Snowpark inside a UDF is not supported — require a Python SPROC instead.
                   if re.search(r'(?i)\bfrom\s+snowflake\.snowpark\b|\bimport\s+snowflake\.snowpark\b', code):
-                      print(f"ERROR: {path} defines a Python UDF that imports snowflake.snowpark. "
-                            f"Move that logic to a Python stored procedure (Snowpark is supported there).",
-                            file=sys.stderr)
+                      print(
+                          f"ERROR: {path} contains a Python UDF that imports snowflake.snowpark. "
+                          f"Move that logic to a Python stored procedure (Snowpark is supported there).",
+                          file=sys.stderr
+                      )
                       sys.exit(2)
 
-                  # Detect pandas / numpy usage in the UDF code
                   needs_pandas = re.search(r'(?i)\b(from|import)\s+pandas\b', code) is not None
                   needs_numpy  = re.search(r'(?i)\b(from|import)\s+numpy\b',  code) is not None
 
                   new_opts = opts
 
-                  # Ensure RUNTIME_VERSION
+                  # Ensure RUNTIME_VERSION is present
                   if re.search(r'(?i)\bRUNTIME_VERSION\b', new_opts) is None:
                       new_opts += "\n  RUNTIME_VERSION = '3.10'"
 
-                  # Ensure PACKAGES present if pandas/numpy are imported
+                  # Ensure PACKAGES includes pandas/numpy if imported in the UDF code
                   if needs_pandas or needs_numpy:
-                      pkg_line = re.search(r'(?i)\bPACKAGES\s*=\s*\((.*?)\)', new_opts)
-                      if pkg_line is None:
+                      pkg_m = re.search(r'(?i)\bPACKAGES\s*=\s*\((.*?)\)', new_opts)
+                      if pkg_m is None:
                           pkgs = []
                           if needs_pandas: pkgs.append("'pandas'")
                           if needs_numpy:  pkgs.append("'numpy'")
-                          new_opts += f"\n  PACKAGES = ({','.join(pkgs)})"
+                          new_opts += f"\n  PACKAGES = ({', '.join(pkgs)})"
                       else:
-                          # Add missing ones into existing PACKAGES
-                          pkgs_text = pkg_line.group(1)
-                          pkgs_set = {p.strip().strip("'").strip('"') for p in pkgs_text.split(",") if p.strip()}
+                          pkgs_text = pkg_m.group(1)
+                          pkgs_set = {
+                              p.strip().strip("'").strip('"')
+                              for p in pkgs_text.split(",") if p.strip()
+                          }
                           if needs_pandas: pkgs_set.add("pandas")
                           if needs_numpy:  pkgs_set.add("numpy")
                           new_pkgs = ", ".join(sorted(f"'{p}'" for p in pkgs_set))
-                          new_opts = re.sub(r'(?i)\bPACKAGES\s*=\s*\((.*?)\)',
-                                            f"PACKAGES = ({new_pkgs})", new_opts, count=1)
+                          new_opts = re.sub(
+                              r'(?i)\bPACKAGES\s*=\s*\((.*?)\)',
+                              f"PACKAGES = ({new_pkgs})",
+                              new_opts,
+                              count=1
+                          )
 
-                  changed = True
+                  if new_opts != opts:
+                      changed[0] = True
+
                   return m.group(1) + new_opts + "\n" + m.group("as") + code + "$$;"
 
               new_s = re.sub(UDF_RE, patch, s)
-              if changed and new_s != s:
-                  path.write_text(new_s, encoding="utf-8")
-                  modified.append(str(path))
 
-          print("Patched UDF files:" if modified else "No Python UDFs needed patching.", modified)
+              if changed[0] and new_s != s:
+                  path.write_text(new_s, encoding="utf-8")
+                  return True
+              return False
+
+          def main():
+              # Collect tracked .sql files; fall back to recursive glob if needed
+              try:
+                  out = subprocess.check_output(["git", "ls-files", "*.sql"], text=True).strip().splitlines()
+                  sql_files = [Path(p) for p in out]
+              except Exception:
+                  sql_files = list(Path(".").rglob("*.sql"))
+
+              modified = [str(p) for p in sql_files if process_file(p)]
+              print("Patched UDF files:" if modified else "No Python UDFs needed patching.", modified)
+
+          if __name__ == "__main__":
+              main()
           PY
 
       # ───────────────────────────────────────────────────────────────────────────
-      # Install SnowSQL
+      # Install SnowSQL (proper major.minor bootstrap path)
       # ───────────────────────────────────────────────────────────────────────────
       - name: Install SnowSQL (with logs)
         id: snowsql
         continue-on-error: true
         env:
-          SNOWSQL_VERSION: "1.2.31"   # 1.2.x line
+          SNOWSQL_VERSION: "1.2.31"   # update to a newer 1.2.x if desired
         run: |
           set -euxo pipefail
           curl -fsSL \
@@ -135,7 +153,7 @@ jobs:
         run: echo "SnowSQL available? -> ${{ steps.snowsql.outputs.ok }}"
 
       # ───────────────────────────────────────────────────────────────────────────
-      # Bootstrap core objects
+      # Bootstrap core objects via SnowSQL
       # ───────────────────────────────────────────────────────────────────────────
       - name: Bootstrap via SnowSQL
         if: steps.snowsql.outputs.ok == 'true'
@@ -167,12 +185,13 @@ jobs:
             UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2)
           );
           SQL
+
           "$HOME/.snowsql/snowsql" \
             -a "$SNOWSQL_ACCOUNT" -u "$SNOWSQL_USER" -r "$SNOWSQL_ROLE" \
             -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" -f bootstrap.sql
 
       # ───────────────────────────────────────────────────────────────────────────
-      # Deploy repo SQL (now patched) — this will create your UDFs safely
+      # Deploy repo SQL (now patched) — this will create UDFs safely
       # ───────────────────────────────────────────────────────────────────────────
       - name: Deploy repo SQL (patched UDFs)
         if: steps.snowsql.outputs.ok == 'true'
@@ -186,7 +205,6 @@ jobs:
           SNOWSQL_SCHEMA:    ${{ secrets.SNOW_SCHEMA }}
         run: |
           set -euxo pipefail
-          # Run all tracked .sql files in a stable order (adjust globs/priorities if your repo needs it)
           mapfile -t FILES < <(git ls-files '*.sql' | sort)
           for f in "${FILES[@]}"; do
             echo ">>> Running $f"
@@ -277,7 +295,7 @@ jobs:
               return f"Loaded {len(df):,} orders for {N:,} customers."
           $$;
 
-          -- Example views (unchanged)
+          -- Example views
           CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
           WITH f AS (
             SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC
@@ -318,6 +336,7 @@ jobs:
           CALL GENERATE_DEMO_DATA();
           SQL
 
+          # Inject env vars into the SQL above (placeholders are literal)
           sed -i "s/\${SNOWSQL_ROLE}/${SNOWSQL_ROLE}/g"         seed_and_views.sql
           sed -i "s/\${SNOWSQL_WAREHOUSE}/${SNOWSQL_WAREHOUSE}/g" seed_and_views.sql
           sed -i "s/\${SNOWSQL_DATABASE}/${SNOWSQL_DATABASE}/g"   seed_and_views.sql
@@ -328,7 +347,9 @@ jobs:
             -w "$SNOWSQL_WAREHOUSE" -d "$SNOWSQL_DATABASE" \
             -f seed_and_views.sql
 
-      # Python fallback retained (connector) — unchanged from your file
+      # ───────────────────────────────────────────────────────────────────────────
+      # Python fallback (when SnowSQL cannot be installed)
+      # ───────────────────────────────────────────────────────────────────────────
       - name: Python fallback — install connector
         if: steps.snowsql.outputs.ok != 'true'
         uses: actions/setup-python@v5
@@ -338,9 +359,9 @@ jobs:
       - name: Python fallback — run deploy script
         if: steps.snowsql.outputs.ok != 'true'
         env:
-          SNOW_HOST:            ${{ secrets.SNOW_HOST }}
-          SNOW_ACCOUNT:         ${{ secrets.SNOW_ACCOUNT }}
-          SNOWFLAKE_ACCOUNT:    ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOW_HOST:            ${{ secrets.SNOW_HOST }}          # optional host
+          SNOW_ACCOUNT:         ${{ secrets.SNOW_ACCOUNT }}       # e.g., xy12345
+          SNOWFLAKE_ACCOUNT:    ${{ secrets.SNOWFLAKE_ACCOUNT }}  # alias (optional)
           SNOW_USER:            ${{ secrets.SNOW_USER }}
           SNOW_PASSWORD:        ${{ secrets.SNOW_PASSWORD }}
           SNOW_ROLE:            ${{ secrets.SNOW_ROLE }}
@@ -351,33 +372,114 @@ jobs:
           set -euxo pipefail
           python -m pip install --upgrade pip
           python -m pip install snowflake-connector-python pandas numpy
+
           python - <<'PY'
           import os, snowflake.connector as sf
-          host=(os.getenv('SNOW_HOST') or '').strip()
-          acct=(os.getenv('SNOW_ACCOUNT') or os.getenv('SNOWFLAKE_ACCOUNT') or '').strip()
-          user=os.environ['SNOW_USER']; pwd=os.environ['SNOW_PASSWORD']
-          role=os.environ['SNOW_ROLE']; wh=os.environ['SNOW_WAREHOUSE']
-          db=os.environ['SNOW_DATABASE']; sc=os.environ['SNOW_SCHEMA']
-          kwargs=dict(user=user,password=pwd,role=role,warehouse=wh,database=db,schema=sc)
-          if host: kwargs['host']=host
-          if acct: kwargs['account']=acct
+
+          host = (os.getenv('SNOW_HOST') or '').strip()
+          acct = (os.getenv('SNOW_ACCOUNT') or os.getenv('SNOWFLAKE_ACCOUNT') or '').strip()
+          user = os.environ['SNOW_USER']; pwd  = os.environ['SNOW_PASSWORD']
+          role = os.environ['SNOW_ROLE']; wh   = os.environ['SNOW_WAREHOUSE']
+          db   = os.environ['SNOW_DATABASE']; sc = os.environ['SNOW_SCHEMA']
+
+          kwargs = dict(user=user, password=pwd, role=role, warehouse=wh, database=db, schema=sc)
+          if host: kwargs['host'] = host
+          if acct: kwargs['account'] = acct
           if ('host' not in kwargs) and ('account' not in kwargs):
-              raise RuntimeError("Provide SNOW_ACCOUNT or SNOW_HOST.")
-          ctx=sf.connect(**kwargs); cs=ctx.cursor()
+              raise RuntimeError("Provide SNOW_ACCOUNT (or SNOWFLAKE_ACCOUNT) or SNOW_HOST.")
+
+          ctx = sf.connect(**kwargs)
+          cs = ctx.cursor()
           try:
-              def exec(sql): print("SQL>", sql.splitlines()[0][:100], "..."); cs.execute(sql)
+              def exec(sql):
+                  print("SQL>", sql.splitlines()[0][:100], "...")
+                  cs.execute(sql)
+
+              # Scope & base objects
               exec(f"USE ROLE {role}")
               exec(f"USE WAREHOUSE {wh}")
               exec(f"USE DATABASE {db}")
               exec(f"CREATE SCHEMA IF NOT EXISTS {sc}")
               exec(f"USE SCHEMA {sc}")
-              # create base tables (same as SnowSQL path) ...
+
               exec("CREATE OR REPLACE TABLE DIM_BRAND (BRAND_ID INT, BRAND_CODE STRING)")
               exec("CREATE OR REPLACE TABLE DIM_CHANNEL (CHANNEL_ID INT, CHANNEL_NAME STRING)")
               exec("CREATE OR REPLACE TABLE DIM_CUSTOMER (CUSTOMER_ID INT, SIGNUP_UTC TIMESTAMP_NTZ, COUNTRY STRING)")
               exec("CREATE OR REPLACE TABLE FACT_SESSIONS (SESSION_ID INT, CUSTOMER_ID INT, SESSION_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING)")
               exec("CREATE OR REPLACE TABLE FACT_ORDERS (ORDER_ID INT, CUSTOMER_ID INT, ORDER_UTC TIMESTAMP_NTZ, BRAND STRING, CHANNEL STRING, UNITS NUMBER(9,0), REVENUE NUMBER(12,2), MARGIN NUMBER(12,2))")
-              # (Keep the rest of your fallback logic here if needed)
+
+              # Snowpark is supported in Python STORED PROCEDURES; ok to use pandas/numpy there.
+              sp = r'''
+              CREATE OR REPLACE PROCEDURE GENERATE_DEMO_DATA()
+              RETURNS STRING
+              LANGUAGE PYTHON
+              RUNTIME_VERSION='3.10'
+              PACKAGES=('snowflake-snowpark-python','pandas','numpy')
+              HANDLER='run'
+              AS
+              $$
+              from snowflake.snowpark import Session
+              import pandas as pd, numpy as np
+              def run(session: Session) -> str:
+                  rng=np.random.default_rng(42)
+                  brands=["JCREW","FACTORY","MADEWELL"]
+                  channels=["Direct","Email","Paid Search","Social","Affiliate","Display"]
+                  session.create_dataframe(pd.DataFrame({"BRAND_ID":[1,2,3],"BRAND_CODE":brands})).write.mode("overwrite").save_as_table("DIM_BRAND")
+                  session.create_dataframe(pd.DataFrame({"CHANNEL_ID":range(1,7),"CHANNEL_NAME":channels})).write.mode("overwrite").save_as_table("DIM_CHANNEL")
+
+                  N=50000; start=pd.Timestamp("2024-09-01"); end=pd.Timestamp("2025-08-31")
+                  def r(n):
+                      d=(end-start).total_seconds()
+                      return [start + pd.Timedelta(seconds=float(np.random.uniform(0,d))) for _ in range(n)]
+
+                  cust=pd.DataFrame({"CUSTOMER_ID":range(1,N+1),"SIGNUP_UTC":r(N),"COUNTRY":np.random.choice(["US","CA","UK"], size=N, p=[.84,.10,.06])})
+                  session.write_pandas(cust, "DIM_CUSTOMER", auto_create_table=True, overwrite=True)
+
+                  rows=[]; oid=1
+                  for cid in range(1,N+1):
+                      k=int(np.clip(np.random.poisson(1.4),0,6))
+                      if k==0: continue
+                      times=sorted(r(k))
+                      bsel=np.random.choice(["JCREW","FACTORY","MADEWELL"], size=k, p=[.55,.30,.15])
+                      ch  =np.random.choice(["Direct","Email","Paid Search","Social","Affiliate","Display"], size=k, p=[.45,.12,.18,.15,.06,.04])
+                      for t,b,c in zip(times,bsel,ch):
+                          base=120 if b=="JCREW" else 85 if b=="MADEWELL" else 70
+                          units=max(1, int(np.round(np.random.gamma(2.0,0.8))))
+                          price=max(25, np.random.normal(base,18))
+                          rev=round(units*price,2); margin=round(rev*np.random.uniform(.48,.63),2)
+                          rows.append((oid,cid,str(t),b,c,units,rev,margin)); oid+=1
+
+                  df=pd.DataFrame(rows, columns=["ORDER_ID","CUSTOMER_ID","ORDER_UTC","BRAND","CHANNEL","UNITS","REVENUE","MARGIN"])
+                  session.write_pandas(df, "FACT_ORDERS", auto_create_table=True, overwrite=True)
+                  return f"Loaded {len(df):,} orders for {N:,} customers."
+              $$;'''
+              exec(sp)
+
+              # Views
+              exec("""
+              CREATE OR REPLACE VIEW VW_FIRST_PURCHASE AS
+              WITH f AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
+              SELECT o.CUSTOMER_ID, o.BRAND AS FIRST_PURCHASE_BRAND, f.FIRST_ORDER_UTC
+              FROM FACT_ORDERS o JOIN f USING (CUSTOMER_ID)
+              WHERE o.ORDER_UTC = f.FIRST_ORDER_UTC
+              QUALIFY ROW_NUMBER() OVER (PARTITION BY o.CUSTOMER_ID ORDER BY o.ORDER_UTC, o.ORDER_ID)=1;
+              """)
+
+              exec("""
+              CREATE OR REPLACE VIEW VW_BRAND_FLOWS_ANY AS
+              SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
+              FROM FACT_ORDERS o JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID) GROUP BY 1,2;
+              """)
+
+              exec("""
+              CREATE OR REPLACE VIEW VW_BRAND_FLOWS_SUBSEQ AS
+              WITH ft AS (SELECT CUSTOMER_ID, MIN(ORDER_UTC) AS FIRST_ORDER_UTC FROM FACT_ORDERS GROUP BY 1)
+              SELECT fp.FIRST_PURCHASE_BRAND AS FROM_BRAND, o.BRAND AS TO_BRAND, COUNT(DISTINCT o.CUSTOMER_ID) AS CUSTOMERS
+              FROM FACT_ORDERS o JOIN ft USING (CUSTOMER_ID) JOIN VW_FIRST_PURCHASE fp USING (CUSTOMER_ID)
+              WHERE o.ORDER_UTC > ft.FIRST_ORDER_UTC GROUP BY 1,2;
+              """)
+
+              exec("CALL GENERATE_DEMO_DATA()")
           finally:
               cs.close(); ctx.close()
           PY
